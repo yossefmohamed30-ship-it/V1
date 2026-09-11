@@ -251,7 +251,6 @@ video.on{display:block}
    الإعدادات — غيّر التلاتة دول بس
    ===================================================================== */
 const CONFIG = {
-  GEMINI_KEY : 'AQ.Ab8RN6IG_d5bKB_rHGihpQCBJoShCsNivD8LX-NwIWA1Cug1wA',
   SCRIPT_URL : 'https://script.google.com/macros/s/AKfycbz_v-JJlXjzgliDZKdahRkZ7xADNvuUbjqgiHT1pcrt9ZPeOLlsbL3_UcfaHCPLv8k/exec',
   MODEL      : 'gemini-3.6-flash',
   FPS        : 2,          // فريمين في الثانية — أدق للتفاصيل الصغيرة
@@ -260,6 +259,9 @@ const CONFIG = {
 };
 
 const API = 'https://generativelanguage.googleapis.com';
+
+/* مفتاح Gemini بيتجاب وقت التشغيل من Apps Script — متخزنش في الكود خالص */
+let GEMINI_KEY = '';
 
 /* =====================================================================
    حالة الشاشة
@@ -308,6 +310,18 @@ function renderApts(selectId) {
     renderApts();
   } catch (e) {
     $('apt').innerHTML = '<option value="">الشقق مش بتحمّل — راجع الرابط</option>';
+  }
+})();
+
+/* بنجيب مفتاح Gemini من الـ Apps Script وقت فتح الصفحة — متسجّلش في الكود خالص */
+(async function loadKey() {
+  try {
+    const r = await jsonp({ action: 'getKey' });
+    if (!r.ok || !r.key) throw new Error(r.error || 'مفيش مفتاح');
+    GEMINI_KEY = r.key;
+  } catch (e) {
+    $('pick').disabled = true;
+    $('pick').innerHTML = 'مقدرش أجيب مفتاح Gemini<em>راجع الرابط</em>';
   }
 })();
 
@@ -415,7 +429,7 @@ function startUpload(file) {
   return fetch(API + '/upload/v1beta/files', {
     method : 'POST',
     headers: {
-      'x-goog-api-key'                  : CONFIG.GEMINI_KEY,
+      'x-goog-api-key'                  : GEMINI_KEY,
       'X-Goog-Upload-Protocol'          : 'resumable',
       'X-Goog-Upload-Command'           : 'start',
       'X-Goog-Upload-Header-Content-Length': String(file.size),
@@ -453,7 +467,7 @@ function sendBytes(uploadUrl, file, onProgress) {
 async function waitActive(name) {
   for (let i = 0; i < 60; i++) {
     const r = await fetch(API + '/v1beta/' + name, {
-      headers: { 'x-goog-api-key': CONFIG.GEMINI_KEY }
+      headers: { 'x-goog-api-key': GEMINI_KEY }
     });
     const f = await r.json();
     if (f.state === 'ACTIVE') return f;
@@ -477,7 +491,7 @@ async function analyze(fileUri, mime, prompt) {
 
   const res = await fetch(API + '/v1beta/interactions', {
     method : 'POST',
-    headers: { 'x-goog-api-key': CONFIG.GEMINI_KEY, 'Content-Type': 'application/json' },
+    headers: { 'x-goog-api-key': GEMINI_KEY, 'Content-Type': 'application/json' },
     body   : JSON.stringify({
       model: CONFIG.MODEL,
       input: [videoPart, { type: 'text', text: prompt }]

@@ -224,8 +224,8 @@ video.on{display:block}
   </ul>
 </div>
 
-<button class="capture" id="pick">صوّر أو اختار الفيديو<em>٤–٥ دقايق تكفي</em></button>
-<input type="file" id="file" accept="video/*" capture="environment">
+<button class="capture" id="pick">صوّر أو اختار فيديو/صور<em>تقدر تختار أكتر من ملف مرة واحدة</em></button>
+<input type="file" id="file" accept="video/*,image/*" multiple>
 
 <div id="status">
   <div class="statline" id="statText"></div>
@@ -421,8 +421,9 @@ ${watch}${invBlock}
 - البلطجة والزبالة والسراير المش مرتبة والمناشف على الأرض = مش تلف. متسجلهاش.
 - الاستهلاك الطبيعي (احتكاك خفيف، لون باهت، خدش قديم شعرة) = مش تلف. متسجلهاش.
 - لو مش متأكد إن ده تلف فعلاً، سجّله بـ confidence واطية بدل ما تتجاهله.
-- متخترعش حاجات مشوفتهاش. كل نتيجة لازم يكون ليها لحظة حقيقية في الفيديو.
-- التوقيت بصيغة MM:SS.
+- متخترعش حاجات مشوفتهاش. كل نتيجة لازم يكون ليها دليل حقيقي في الوسائط اللي بعتهالك (فيديو أو صورة).
+- ممكن يوصلك أكتر من فيديو و/أو أكتر من صورة للشقة نفسها — عاملهم كلهم كدليل واحد شامل للشقة.
+- لو الدليل من فيديو: حط التوقيت بصيغة MM:SS في timestamp. لو الدليل من صورة (مفيهاش توقيت أصلاً): سيب timestamp فاضي وقول في location/description إن المصدر صورة.
 
 رجّع JSON بس، من غير أي كلام قبله أو بعده ومن غير علامات كود:
 {
@@ -502,21 +503,27 @@ async function waitActive(name) {
 /* =====================================================================
    التحليل
    ===================================================================== */
-async function analyze(fileUri, mime, prompt) {
-  const videoPart = {
-    type      : 'video',
-    uri       : fileUri,
-    mime_type : mime || 'video/mp4',
-    processing: { type: 'static', fps: CONFIG.FPS }
-  };
-  if (CONFIG.MEDIA_RES) videoPart.media_resolution = CONFIG.MEDIA_RES;
+async function analyze(mediaList, prompt) {
+  const mediaParts = mediaList.map(m => {
+    if (m.isVideo) {
+      const part = {
+        type      : 'video',
+        uri       : m.uri,
+        mime_type : m.mime || 'video/mp4',
+        processing: { type: 'static', fps: CONFIG.FPS }
+      };
+      if (CONFIG.MEDIA_RES) part.media_resolution = CONFIG.MEDIA_RES;
+      return part;
+    }
+    return { type: 'image', uri: m.uri, mime_type: m.mime || 'image/jpeg' };
+  });
 
   const res = await fetch(API + '/v1beta/interactions', {
     method : 'POST',
     headers: { 'x-goog-api-key': GEMINI_KEY, 'Content-Type': 'application/json' },
     body   : JSON.stringify({
       model: CONFIG.MODEL,
-      input: [videoPart, { type: 'text', text: prompt }]
+      input: [...mediaParts, { type: 'text', text: prompt }]
     })
   });
 
@@ -546,9 +553,9 @@ $('pick').onclick = () => {
 };
 
 $('file').onchange = async e => {
-  const file = e.target.files && e.target.files[0];
-  if (!file) return;
-  run(file);
+  const files = e.target.files;
+  if (!files || !files.length) return;
+  run(Array.from(files));
 };
 
 function setStatus(msg, pct, isErr) {
@@ -558,33 +565,51 @@ function setStatus(msg, pct, isErr) {
   $('statBar').style.width = (pct == null ? 0 : pct) + '%';
 }
 
-async function run(file) {
+async function uploadOneFile(file, onProgress) {
+  const uploadUrl = await startUpload(file);
+  const meta      = await sendBytes(uploadUrl, file, onProgress);
+  const ready     = await waitActive(meta.name);
+  return {
+    uri    : ready.uri,
+    mime   : ready.mimeType || file.type,
+    isVideo: (file.type || '').startsWith('video/'),
+    name   : file.name || ''
+  };
+}
+
+async function run(files) {
   const apt = apts.find(a => a.apt_id === $('apt').value);
 
   $('result').classList.remove('on');
   $('saveRow').classList.remove('on');
   $('pick').disabled = true;
 
+  const previewFile = files.find(f => (f.type || '').startsWith('video/')) || files[0];
   const player = $('player');
-  player.src = URL.createObjectURL(file);
+  player.src = URL.createObjectURL(previewFile);
   player.classList.add('on');
 
   try {
-    setStatus('بيرفع الفيديو…', 0);
     const invPromise = apt
       ? jsonp({ action: 'inventory', apt_id: apt.apt_id }).catch(() => ({ ok: false }))
       : Promise.resolve({ ok: false });
-    const uploadUrl = await startUpload(file);
-    const meta      = await sendBytes(uploadUrl, file, p => setStatus('بيرفع الفيديو… ' + p + '%', p));
 
-    setStatus('Gemini بيجهّز الفيديو…', 100);
-    const ready = await waitActive(meta.name);
+    const uploaded = [];
+    for (let i = 0; i < files.length; i++) {
+      const f = files[i];
+      const base = Math.round(i / files.length * 100);
+      setStatus(`بيرفع ملف ${i + 1} من ${files.length}…`, base);
+      const u = await uploadOneFile(f, p =>
+        setStatus(`بيرفع ملف ${i + 1} من ${files.length}… ${p}%`, Math.round(base + p / files.length))
+      );
+      uploaded.push(u);
+    }
 
-    const invRes     = await invPromise;
-    const inventory  = (invRes && invRes.ok) ? (invRes.items || []) : [];
+    const invRes    = await invPromise;
+    const inventory = (invRes && invRes.ok) ? (invRes.items || []) : [];
 
-    setStatus('بيفحص كل ثانية في الفيديو…', 100);
-    const out = await analyze(ready.uri, ready.mimeType || file.type, buildPrompt(apt, inventory));
+    setStatus('بيفحص كل حاجة…', 100);
+    const out = await analyze(uploaded, buildPrompt(apt, inventory));
 
     overall  = out.overall || 'issues';
     summary  = out.summary_ar || '';
@@ -618,7 +643,7 @@ function render() {
       <div class="box">
         <div class="head">
           <span class="what">${esc(f.item || 'حاجة')}</span>
-          <button class="ts" data-ts="${esc(f.timestamp || '')}">▶ ${esc(f.timestamp || '--:--')}</button>
+          <button class="ts" data-ts="${esc(f.timestamp || '')}">${f.timestamp ? '▶ ' + esc(f.timestamp) : '📷 صورة'}</button>
         </div>
         <div class="where">${esc(f.location || '')}</div>
         <p class="desc">${esc(f.description_ar || '')}</p>
@@ -642,8 +667,8 @@ function esc(s) {
 /* نقرة على التوقيت = الفيديو يروح عند اللحظة دي */
 $('list').addEventListener('click', ev => {
   const ts = ev.target.closest('.ts');
-  if (ts) {
-    const [m, s] = (ts.dataset.ts || '0:0').split(':').map(Number);
+  if (ts && ts.dataset.ts) {
+    const [m, s] = ts.dataset.ts.split(':').map(Number);
     const p = $('player');
     p.currentTime = Math.max(0, (m || 0) * 60 + (s || 0) - 1);
     p.play();

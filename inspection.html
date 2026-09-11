@@ -179,6 +179,16 @@ video.on{display:block}
 </div>
 
 <div class="field">
+  <label>الوضع</label>
+  <div class="stage">
+    <button type="button" id="modeNormal" aria-pressed="true">استلام شقة حقيقية</button>
+    <button type="button" id="modeTest" aria-pressed="false">🧪 تجربة قبل/بعد</button>
+  </div>
+</div>
+
+<div id="normalMode">
+
+<div class="field">
   <label for="apt">الشقة</label>
   <select id="apt"><option value="">بيحمّل…</option></select>
   <button type="button" id="newAptToggle" class="linklike">+ شقة جديدة</button>
@@ -226,6 +236,34 @@ video.on{display:block}
 
 <button class="capture" id="pick">صوّر أو اختار فيديو/صور<em>تقدر تختار أكتر من ملف مرة واحدة</em></button>
 <input type="file" id="file" accept="video/*,image/*" multiple>
+
+</div>
+
+<div id="testModeBox" hidden>
+  <div class="hint">
+    <b>🧪 وضع تجربة — من غير شقة ولا شيت</b>
+    <ul>
+      <li>صوّر أو اختار وسائط "قبل" لأي مكان (حتى بيتك)</li>
+      <li>غيّر حاجة (شيل غرض، كسر حاجة، حط حاجة جديدة)</li>
+      <li>صوّر أو اختار وسائط "بعد"</li>
+      <li>النظام هيقارن الاتنين ويقولك لقى إيه</li>
+    </ul>
+  </div>
+
+  <div class="field">
+    <label>قبل</label>
+    <button type="button" class="capture" id="pickBefore" style="margin:0">اختار فيديو/صور "قبل"<em id="beforeCount">مفيش حاجة لسه</em></button>
+    <input type="file" id="fileBefore" accept="video/*,image/*" multiple hidden>
+  </div>
+
+  <div class="field">
+    <label>بعد</label>
+    <button type="button" class="capture" id="pickAfter" style="margin:0">اختار فيديو/صور "بعد"<em id="afterCount">مفيش حاجة لسه</em></button>
+    <input type="file" id="fileAfter" accept="video/*,image/*" multiple hidden>
+  </div>
+
+  <button type="button" class="capture" id="runTest" style="border-style:solid" disabled>قارن قبل/بعد دلوقتي</button>
+</div>
 
 <div id="status">
   <div class="statline" id="statText"></div>
@@ -503,8 +541,8 @@ async function waitActive(name) {
 /* =====================================================================
    التحليل
    ===================================================================== */
-async function analyze(mediaList, prompt) {
-  const mediaParts = mediaList.map(m => {
+function mediaToParts(mediaList) {
+  return mediaList.map(m => {
     if (m.isVideo) {
       const part = {
         type      : 'video',
@@ -517,14 +555,13 @@ async function analyze(mediaList, prompt) {
     }
     return { type: 'image', uri: m.uri, mime_type: m.mime || 'image/jpeg' };
   });
+}
 
+async function callGemini(inputParts) {
   const res = await fetch(API + '/v1beta/interactions', {
     method : 'POST',
     headers: { 'x-goog-api-key': GEMINI_KEY, 'Content-Type': 'application/json' },
-    body   : JSON.stringify({
-      model: CONFIG.MODEL,
-      input: [...mediaParts, { type: 'text', text: prompt }]
-    })
+    body   : JSON.stringify({ model: CONFIG.MODEL, input: inputParts })
   });
 
   const data = await res.json();
@@ -544,6 +581,99 @@ async function analyze(mediaList, prompt) {
   return JSON.parse(text.slice(s, e + 1));
 }
 
+async function analyze(mediaList, prompt) {
+  return callGemini([...mediaToParts(mediaList), { type: 'text', text: prompt }]);
+}
+
+/* =====================================================================
+   وضع التجربة — قبل / بعد
+   ===================================================================== */
+function buildTestPrompt() {
+  return `دي تجربة لنظام كشف الفروق بين "قبل" و"بعد" لنفس المكان — مفيش شقة ولا قائمة محتويات، بس قارن بعينك.
+
+هتوصلك مجموعتين من الوسائط: مجموعة اتعلّم عليها إنها "قبل" (الحالة الأصلية)، ومجموعة "بعد" (الحالة الحالية اللي عايزين نقارنها بالأول). ممكن كل مجموعة تكون فيها أكتر من فيديو أو صورة.
+
+قارن المجموعتين ولاحظ:
+- أي حاجة كانت موجودة في "قبل" ومش موجودة في "بعد" (اتشالت أو مفقودة)
+- أي حاجة جديدة ظهرت في "بعد" مكانتش في "قبل"
+- أي حاجة اتغيّر مكانها أو وضعها
+- أي كسر أو خدش أو تلف أو بقعة ظهرت في "بعد" ومكانتش في "قبل"
+
+قواعد:
+- متخترعش فروق مشوفتهاش فعلاً. كل نتيجة لازم يكون ليها دليل واضح في الوسائط.
+- لو مش متأكد، سجّله بـ confidence واطية بدل ما تتجاهله.
+- في description_ar وضّح إن ده لاحظته في مجموعة "قبل" ولا "بعد"، وسيب timestamp فاضي دايمًا (عندنا أكتر من فيديو فمش هيبقى واضح توقيته لوحده).
+
+رجّع JSON بس، من غير أي كلام قبله أو بعده ومن غير علامات كود:
+{
+  "overall": "clean" أو "issues",
+  "summary_ar": "سطر واحد بالعامية المصرية يلخص الفرق الرئيسي",
+  "findings": [
+    {
+      "item": "اسم الحاجة بالعربي",
+      "location": "مكانها",
+      "type": "tear" أو "burn" أو "crack" أو "stain" أو "melt" أو "water" أو "missing" أو "added" أو "moved" أو "other",
+      "description_ar": "وصف قصير بالعامية، موضّح فيه (من قبل) أو (من بعد)",
+      "timestamp": "",
+      "severity": "low" أو "medium" أو "high",
+      "confidence": رقم بين 0 و 1,
+      "claimable": false
+    }
+  ]
+}
+لو مفيش فرق واضح، رجّع overall = "clean" و findings = [].`;
+}
+
+async function runTestMode(beforeFiles, afterFiles) {
+  if (!beforeFiles.length || !afterFiles.length) { alert('اختار وسائط "قبل" و"بعد" الأول'); return; }
+
+  $('result').classList.remove('on');
+  $('saveRow').classList.remove('on');
+  $('runTest').disabled = true;
+
+  const previewFile = beforeFiles.find(f => (f.type || '').startsWith('video/')) || beforeFiles[0];
+  const player = $('player');
+  player.src = URL.createObjectURL(previewFile);
+  player.classList.add('on');
+
+  try {
+    const beforeMedia = [];
+    const afterMedia  = [];
+    const all = [...beforeFiles.map(f => ({ f, grp: 'قبل' })), ...afterFiles.map(f => ({ f, grp: 'بعد' }))];
+
+    for (let i = 0; i < all.length; i++) {
+      const { f, grp } = all[i];
+      const base = Math.round(i / all.length * 100);
+      setStatus(`بيرفع (${grp}) ملف ${i + 1} من ${all.length}…`, base);
+      const u = await uploadOneFile(f, p =>
+        setStatus(`بيرفع (${grp}) ملف ${i + 1} من ${all.length}… ${p}%`, Math.round(base + p / all.length))
+      );
+      (grp === 'قبل' ? beforeMedia : afterMedia).push(u);
+    }
+
+    setStatus('بيقارن قبل وبعد…', 100);
+    const parts = [
+      { type: 'text', text: 'الوسائط الجاية دي مجموعة "قبل" — الحالة الأصلية:' },
+      ...mediaToParts(beforeMedia),
+      { type: 'text', text: 'الوسائط الجاية دي مجموعة "بعد" — الحالة الحالية اللي هنقارنها بالأول:' },
+      ...mediaToParts(afterMedia),
+      { type: 'text', text: buildTestPrompt() }
+    ];
+    const out = await callGemini(parts);
+
+    overall  = out.overall || 'issues';
+    summary  = out.summary_ar || '';
+    findings = (out.findings || []).map((f, i) => ({ ...f, n: i + 1, keep: true }));
+
+    $('status').classList.remove('on');
+    render(true);
+  } catch (err) {
+    setStatus(err.message || 'حصلت مشكلة', 0, true);
+  } finally {
+    $('runTest').disabled = false;
+  }
+}
+
 /* =====================================================================
    التشغيل
    ===================================================================== */
@@ -557,6 +687,40 @@ $('file').onchange = async e => {
   if (!files || !files.length) return;
   run(Array.from(files));
 };
+
+/* =====================================================================
+   تبديل الوضع: شقة حقيقية / تجربة قبل-بعد
+   ===================================================================== */
+let testBefore = [], testAfter = [];
+
+$('modeNormal').onclick = () => setMode(false);
+$('modeTest').onclick   = () => setMode(true);
+
+function setMode(isTest) {
+  $('modeNormal').setAttribute('aria-pressed', String(!isTest));
+  $('modeTest').setAttribute('aria-pressed', String(isTest));
+  $('normalMode').hidden  = isTest;
+  $('testModeBox').hidden = !isTest;
+  $('result').classList.remove('on');
+  $('saveRow').classList.remove('on');
+  $('player').classList.remove('on');
+}
+
+$('pickBefore').onclick = () => $('fileBefore').click();
+$('pickAfter').onclick  = () => $('fileAfter').click();
+
+$('fileBefore').onchange = e => {
+  testBefore = Array.from(e.target.files || []);
+  $('beforeCount').textContent = testBefore.length ? `${testBefore.length} ملف مختار` : 'مفيش حاجة لسه';
+  $('runTest').disabled = !(testBefore.length && testAfter.length);
+};
+$('fileAfter').onchange = e => {
+  testAfter = Array.from(e.target.files || []);
+  $('afterCount').textContent = testAfter.length ? `${testAfter.length} ملف مختار` : 'مفيش حاجة لسه';
+  $('runTest').disabled = !(testBefore.length && testAfter.length);
+};
+
+$('runTest').onclick = () => runTestMode(testBefore, testAfter);
 
 function setStatus(msg, pct, isErr) {
   $('status').classList.add('on');
@@ -630,12 +794,16 @@ async function run(files) {
    ===================================================================== */
 const SEV = { high: 'خطير', medium: 'متوسط', low: 'بسيط' };
 
-function render() {
+function render(isTest) {
   const v = $('verdict');
   v.className = 'verdict ' + (overall === 'clean' ? 'clean' : 'issues');
   v.innerHTML = overall === 'clean'
-    ? `<strong>الشقة سليمة</strong><p>${summary || 'مفيش تلف ظاهر في الفيديو.'}</p>`
-    : `<strong>${findings.length} حاجة محتاجة نظرة</strong><p>${summary || ''}</p>`;
+    ? (isTest
+        ? `<strong>مفيش فرق واضح</strong><p>${summary || 'قبل وبعد متطابقين تقريبًا.'}</p>`
+        : `<strong>الشقة سليمة</strong><p>${summary || 'مفيش تلف ظاهر في الفيديو.'}</p>`)
+    : (isTest
+        ? `<strong>${findings.length} فرق بين قبل وبعد</strong><p>${summary || ''}</p>`
+        : `<strong>${findings.length} حاجة محتاجة نظرة</strong><p>${summary || ''}</p>`);
 
   $('list').innerHTML = findings.map(f => `
     <li class="f ${f.severity || 'low'}" data-n="${f.n}">
@@ -656,7 +824,7 @@ function render() {
     </li>`).join('');
 
   $('result').classList.add('on');
-  $('saveRow').classList.add('on');
+  if (!isTest) $('saveRow').classList.add('on');
 }
 
 function esc(s) {

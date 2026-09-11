@@ -374,9 +374,31 @@ function setStage(v) {
 /* =====================================================================
    البرومبت
    ===================================================================== */
-function buildPrompt(apt) {
+function formatInventory(items) {
+  if (!items || !items.length) return '';
+  const byRoom = {};
+  items.forEach(it => {
+    const r = (it.room || 'عام').trim();
+    (byRoom[r] = byRoom[r] || []).push(`${it.item}${it.qty && it.qty !== '1' ? ' ×' + it.qty : ''}`);
+  });
+  return Object.keys(byRoom)
+    .map(room => `[${room}]\n${byRoom[room].join('، ')}`)
+    .join('\n');
+}
+
+function buildPrompt(apt, inventory) {
   const watch = apt && apt.watchlist
     ? `\nحاجات محددة في الشقة دي لازم تتفحص بعناية:\n${apt.watchlist}\n`
+    : '';
+
+  const invList = formatInventory(inventory);
+  const invBlock = invList
+    ? `\nقائمة محتويات الشقة الرسمية (من نظام الجرد الداخلي — ده المرجع الأساسي لأي حاجة مفقودة):\n${invList}\n
+قواعد المقارنة مع القائمة دي:
+- لو غرض أساسي (أثاث، جهاز كهربائي، تلفزيون، إضاءة، مرايا) مذكور في القائمة ومش ظاهر له أي أثر في الفيديو خالص، سجّله كـ "missing" بخطورة high.
+- لو غرض استهلاكي صغير (مناديل، صابون، شامبو، شمعة) ناقص، سجّله كـ "missing" بخطورة low بس.
+- لو الكاميرا أصلاً ما وصلتش للمكان ده في الفيديو، متسجلش "مفقود" — قول في الملاحظة إن المكان محتاج يتصور في المرة الجاية.
+`
     : '';
 
   const job = stage === 'checkout'
@@ -386,7 +408,7 @@ function buildPrompt(apt) {
 مهمتك: تتأكد إن الشقة جاهزة للتسليم — أي تلف باقي، أي حاجة مكسورة أو مبقعة، أو أي حاجة واضح إنها ناقصة أو مش في مكانها.`;
 
   return `${job}
-${watch}
+${watch}${invBlock}
 دوّر بالتحديد على:
 - قطع أو خدش أو تقشير في الجلد والقماش (خصوصًا على الكنب والكراسي)
 - حرق أو انصهار في البلاستيك أو الخشب أو الرخام
@@ -549,14 +571,20 @@ async function run(file) {
 
   try {
     setStatus('بيرفع الفيديو…', 0);
+    const invPromise = apt
+      ? jsonp({ action: 'inventory', apt_id: apt.apt_id }).catch(() => ({ ok: false }))
+      : Promise.resolve({ ok: false });
     const uploadUrl = await startUpload(file);
     const meta      = await sendBytes(uploadUrl, file, p => setStatus('بيرفع الفيديو… ' + p + '%', p));
 
     setStatus('Gemini بيجهّز الفيديو…', 100);
     const ready = await waitActive(meta.name);
 
+    const invRes     = await invPromise;
+    const inventory  = (invRes && invRes.ok) ? (invRes.items || []) : [];
+
     setStatus('بيفحص كل ثانية في الفيديو…', 100);
-    const out = await analyze(ready.uri, ready.mimeType || file.type, buildPrompt(apt));
+    const out = await analyze(ready.uri, ready.mimeType || file.type, buildPrompt(apt, inventory));
 
     overall  = out.overall || 'issues';
     summary  = out.summary_ar || '';

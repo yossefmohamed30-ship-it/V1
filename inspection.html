@@ -292,7 +292,7 @@ const CONFIG = {
   SCRIPT_URL : 'https://script.google.com/macros/s/AKfycbz_v-JJlXjzgliDZKdahRkZ7xADNvuUbjqgiHT1pcrt9ZPeOLlsbL3_UcfaHCPLv8k/exec',
   MODEL      : 'gemini-3.6-flash',
   FPS        : 2,          // فريمين في الثانية — أدق للتفاصيل الصغيرة
-  MEDIA_RES  : 'high',     // خليها '' لو عايز تقلل التكلفة
+  MEDIA_RES  : '',         // مش مدعومة حاليًا في الـ API — سيبها فاضية
   BY         : ''          // اسم اللي بيستلم (اختياري)
 };
 
@@ -544,14 +544,12 @@ async function waitActive(name) {
 function mediaToParts(mediaList) {
   return mediaList.map(m => {
     if (m.isVideo) {
-      const part = {
+      return {
         type      : 'video',
         uri       : m.uri,
         mime_type : m.mime || 'video/mp4',
         processing: { type: 'static', fps: CONFIG.FPS }
       };
-      if (CONFIG.MEDIA_RES) part.media_resolution = CONFIG.MEDIA_RES;
-      return part;
     }
     return { type: 'image', uri: m.uri, mime_type: m.mime || 'image/jpeg' };
   });

@@ -1,0 +1,611 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>استلام الشقة</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans+Arabic:wght@400;500;600;700&display=swap" rel="stylesheet">
+
+<style>
+:root{
+  --paper:#EDF1EF;
+  --card:#FFFFFF;
+  --ink:#111A16;
+  --muted:#657570;
+  --line:#D3DBD8;
+  --green:#14503F;
+  --green-soft:#E2EDE8;
+  --amber:#A05500;
+  --amber-soft:#FBEEDC;
+  --red:#A32718;
+  --red-soft:#F9E4E1;
+  --r:14px;
+}
+
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+html,body{margin:0;padding:0}
+body{
+  background:var(--paper);
+  color:var(--ink);
+  font-family:'IBM Plex Sans Arabic',system-ui,sans-serif;
+  font-size:16px;
+  line-height:1.6;
+  padding:0 16px 120px;
+  max-width:560px;
+  margin:0 auto;
+}
+
+/* ---------- شريط علوي ---------- */
+.top{
+  display:flex;align-items:baseline;justify-content:space-between;
+  padding:20px 0 14px;border-bottom:2px solid var(--ink);margin-bottom:20px;
+}
+.top h1{font-size:20px;font-weight:700;margin:0;letter-spacing:-.2px}
+.top span{font-size:13px;color:var(--muted)}
+
+/* ---------- حقول ---------- */
+.field{margin-bottom:14px}
+.field label{display:block;font-size:14px;font-weight:600;margin-bottom:6px}
+select,input[type=text]{
+  width:100%;padding:13px 12px;font:inherit;font-size:16px;
+  background:var(--card);color:var(--ink);
+  border:1px solid var(--line);border-radius:var(--r);
+}
+select:focus,input:focus{outline:2px solid var(--green);outline-offset:1px}
+
+.stage{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+.stage button{
+  padding:14px 8px;font:inherit;font-size:15px;font-weight:600;
+  background:var(--card);color:var(--muted);
+  border:1px solid var(--line);border-radius:var(--r);cursor:pointer;
+}
+.stage button[aria-pressed="true"]{
+  background:var(--green);color:#fff;border-color:var(--green);
+}
+.stage small{display:block;font-weight:400;font-size:12px;opacity:.85;margin-top:2px}
+
+/* ---------- زرار التصوير ---------- */
+.capture{
+  margin:22px 0 8px;width:100%;
+  padding:26px 16px;border:2px dashed var(--green);border-radius:var(--r);
+  background:var(--green-soft);color:var(--green);
+  font:inherit;font-size:18px;font-weight:700;cursor:pointer;
+}
+.capture:disabled{opacity:.45;cursor:not-allowed}
+.capture em{display:block;font-style:normal;font-size:13px;font-weight:500;color:var(--muted);margin-top:6px}
+#file{display:none}
+
+.hint{
+  background:var(--card);border:1px solid var(--line);border-radius:var(--r);
+  padding:14px 16px;margin-bottom:18px;font-size:14px;color:var(--muted);
+}
+.hint b{color:var(--ink);display:block;margin-bottom:6px;font-size:14px}
+.hint ul{margin:0;padding-inline-start:18px}
+.hint li{margin-bottom:3px}
+
+/* ---------- الحالة ---------- */
+#status{display:none;margin:16px 0}
+#status.on{display:block}
+.bar{height:6px;background:var(--line);border-radius:99px;overflow:hidden;margin-top:10px}
+.bar i{display:block;height:100%;width:0;background:var(--green);transition:width .25s}
+.statline{font-size:15px;font-weight:600}
+.statline.err{color:var(--red)}
+
+/* ---------- الفيديو ---------- */
+video{width:100%;border-radius:var(--r);background:#000;display:none;margin-bottom:18px}
+video.on{display:block}
+
+/* ---------- النتيجة ---------- */
+#result{display:none}
+#result.on{display:block}
+
+.verdict{
+  border-radius:var(--r);padding:16px;margin-bottom:18px;
+  border:1px solid var(--line);background:var(--card);
+}
+.verdict.clean{background:var(--green-soft);border-color:var(--green)}
+.verdict.issues{background:var(--amber-soft);border-color:var(--amber)}
+.verdict strong{display:block;font-size:17px;margin-bottom:4px}
+.verdict p{margin:0;font-size:14px}
+
+.findings{list-style:none;margin:0;padding:0;position:relative}
+.findings::before{
+  content:"";position:absolute;inset-block:14px auto;bottom:14px;
+  inset-inline-start:15px;width:2px;background:var(--line);
+}
+.f{position:relative;padding-inline-start:44px;margin-bottom:14px}
+.f .dot{
+  position:absolute;inset-inline-start:4px;top:12px;
+  width:24px;height:24px;border-radius:50%;
+  display:grid;place-items:center;font-size:12px;font-weight:700;color:#fff;
+  background:var(--muted);
+}
+.f.high .dot{background:var(--red)}
+.f.medium .dot{background:var(--amber)}
+.f.low .dot{background:var(--muted)}
+
+.f .box{background:var(--card);border:1px solid var(--line);border-radius:var(--r);padding:13px 14px}
+.f.high .box{border-color:var(--red)}
+.f .head{display:flex;justify-content:space-between;gap:10px;align-items:baseline}
+.f .what{font-weight:700;font-size:15px}
+.f .ts{
+  font-size:13px;font-weight:600;color:var(--green);
+  background:var(--green-soft);border:0;border-radius:8px;
+  padding:4px 9px;cursor:pointer;font-family:inherit;white-space:nowrap;
+}
+.f .where{font-size:13px;color:var(--muted);margin-top:2px}
+.f .desc{font-size:14px;margin:8px 0 0}
+.f .meta{font-size:12px;color:var(--muted);margin-top:6px}
+.f .acts{display:flex;gap:8px;margin-top:10px}
+.f .acts button{
+  flex:1;padding:9px;font:inherit;font-size:14px;font-weight:600;
+  background:var(--paper);color:var(--muted);
+  border:1px solid var(--line);border-radius:10px;cursor:pointer;
+}
+.f .acts button[aria-pressed="true"]{background:var(--ink);color:#fff;border-color:var(--ink)}
+.f.off .box{opacity:.42}
+
+.saveRow{
+  position:fixed;inset-inline:0;bottom:0;padding:12px 16px calc(12px + env(safe-area-inset-bottom));
+  background:var(--paper);border-top:1px solid var(--line);
+}
+.saveRow .inner{max-width:560px;margin:0 auto;display:flex;gap:8px}
+.saveRow button{
+  flex:1;padding:15px;font:inherit;font-size:16px;font-weight:700;
+  background:var(--ink);color:#fff;border:0;border-radius:var(--r);cursor:pointer;
+}
+.saveRow button.ghost{flex:0 0 40%;background:transparent;color:var(--ink);border:1px solid var(--line)}
+.saveRow button:disabled{opacity:.4}
+.saveRow{display:none}
+.saveRow.on{display:block}
+</style>
+</head>
+<body>
+
+<div class="top">
+  <h1>استلام الشقة</h1>
+  <span id="who"></span>
+</div>
+
+<div class="field">
+  <label for="apt">الشقة</label>
+  <select id="apt"><option value="">بيحمّل…</option></select>
+</div>
+
+<div class="field">
+  <label>نوع الجولة</label>
+  <div class="stage">
+    <button type="button" id="sCheckout" aria-pressed="true">
+      بعد خروج الجيست<small>أدلة — قبل أي تنضيف</small>
+    </button>
+    <button type="button" id="sHandover" aria-pressed="false">
+      تسليم للجيست الجديد<small>بعد التنضيف</small>
+    </button>
+  </div>
+</div>
+
+<div class="field">
+  <label for="ref">رقم الحجز (اختياري)</label>
+  <input type="text" id="ref" placeholder="HMXXXXXX">
+</div>
+
+<div class="hint">
+  <b>قبل ما تصور</b>
+  <ul>
+    <li>افتح كل النور والستاير</li>
+    <li>امشي نفس المسار كل مرة، بالراحة</li>
+    <li>قرّب بجسمك — <b style="display:inline">متزوّمش</b></li>
+    <li>وقّف ٢–٣ ثواني على كل جلد وخشب وحيطة</li>
+    <li>آخر لقطة: طربيزة الأطباق كاملة</li>
+  </ul>
+</div>
+
+<button class="capture" id="pick">صوّر أو اختار الفيديو<em>٢–٣ دقايق تكفي</em></button>
+<input type="file" id="file" accept="video/*" capture="environment">
+
+<div id="status">
+  <div class="statline" id="statText"></div>
+  <div class="bar"><i id="statBar"></i></div>
+</div>
+
+<video id="player" controls playsinline preload="metadata"></video>
+
+<div id="result">
+  <div class="verdict" id="verdict"></div>
+  <ul class="findings" id="list"></ul>
+</div>
+
+<div class="saveRow" id="saveRow">
+  <div class="inner">
+    <button class="ghost" id="again">فيديو تاني</button>
+    <button id="save">احفظ التقرير</button>
+  </div>
+</div>
+
+<script>
+/* =====================================================================
+   الإعدادات — غيّر التلاتة دول بس
+   ===================================================================== */
+const CONFIG = {
+  GEMINI_KEY : 'ضع_مفتاح_GEMINI_هنا',
+  SCRIPT_URL : 'ضع_رابط_نشر_الـApps_Script_هنا',   // .../exec
+  MODEL      : 'gemini-3.8-flash',
+  FPS        : 2,          // فريمين في الثانية — أدق للتفاصيل الصغيرة
+  MEDIA_RES  : 'high',     // خليها '' لو عايز تقلل التكلفة
+  BY         : ''          // اسم اللي بيستلم (اختياري)
+};
+
+const API = 'https://generativelanguage.googleapis.com';
+
+/* =====================================================================
+   حالة الشاشة
+   ===================================================================== */
+let apts = [], stage = 'checkout', findings = [], overall = '', summary = '';
+
+const $ = id => document.getElementById(id);
+document.getElementById('who').textContent = CONFIG.BY || '';
+
+/* =====================================================================
+   JSONP — نفس نمط باقي السيستم
+   ===================================================================== */
+function jsonp(params) {
+  return new Promise((resolve, reject) => {
+    const cb = 'cb_' + Math.random().toString(36).slice(2);
+    const s  = document.createElement('script');
+    const to = setTimeout(() => { cleanup(); reject(new Error('الاتصال بالشيت اتأخر')); }, 20000);
+
+    function cleanup() { clearTimeout(to); delete window[cb]; s.remove(); }
+    window[cb] = data => { cleanup(); resolve(data); };
+
+    const qs = Object.entries(params)
+      .map(([k, v]) => encodeURIComponent(k) + '=' + encodeURIComponent(v == null ? '' : v))
+      .join('&');
+
+    s.src = CONFIG.SCRIPT_URL + '?' + qs + '&callback=' + cb;
+    s.onerror = () => { cleanup(); reject(new Error('مش قادر يوصل للشيت')); };
+    document.body.appendChild(s);
+  });
+}
+
+/* =====================================================================
+   تحميل الشقق
+   ===================================================================== */
+(async function loadApts() {
+  try {
+    const r = await jsonp({ action: 'apts' });
+    if (!r.ok) throw new Error(r.error);
+    apts = r.apts || [];
+    $('apt').innerHTML = '<option value="">اختار الشقة</option>' +
+      apts.map(a => `<option value="${a.apt_id}">${a.apt_name}</option>`).join('');
+  } catch (e) {
+    $('apt').innerHTML = '<option value="">الشقق مش بتحمّل — راجع الرابط</option>';
+  }
+})();
+
+/* =====================================================================
+   اختيار نوع الجولة
+   ===================================================================== */
+$('sCheckout').onclick = () => setStage('checkout');
+$('sHandover').onclick = () => setStage('handover');
+function setStage(v) {
+  stage = v;
+  $('sCheckout').setAttribute('aria-pressed', v === 'checkout');
+  $('sHandover').setAttribute('aria-pressed', v === 'handover');
+}
+
+/* =====================================================================
+   البرومبت
+   ===================================================================== */
+function buildPrompt(apt) {
+  const watch = apt && apt.watchlist
+    ? `\nحاجات محددة في الشقة دي لازم تتفحص بعناية:\n${apt.watchlist}\n`
+    : '';
+
+  const job = stage === 'checkout'
+    ? `ده فيديو لشقة مفروشة بعد ما ضيف خرج منها مباشرة، وقبل أي تنضيف. الشقة متبهدلة ومتلخبطة وده متوقع تمامًا — البهدلة نفسها مش عيب ومش تقرير.
+مهمتك: تلاقي التلف الحقيقي فقط.`
+    : `ده فيديو لشقة مفروشة بعد ما اتنضفت وقبل ما ضيف جديد يدخل.
+مهمتك: تتأكد إن الشقة جاهزة للتسليم — أي تلف باقي، أي حاجة مكسورة أو مبقعة، أو أي حاجة واضح إنها ناقصة أو مش في مكانها.`;
+
+  return `${job}
+${watch}
+دوّر بالتحديد على:
+- قطع أو خدش أو تقشير في الجلد والقماش (خصوصًا على الكنب والكراسي)
+- حرق أو انصهار في البلاستيك أو الخشب أو الرخام
+- كسر أو شرخ في الحيطان أو السيراميك أو الزجاج أو المرايات أو الشاشات
+- بقع واضحة أو مياه أو رطوبة
+- أي حاجة مخلوعة أو واقعة أو مركبة غلط
+- في آخر الفيديو: لو ظهرت طربيزة عليها أطباق مرصوصة، عدّ الأطباق واذكر العدد
+
+قواعد مهمة:
+- البلطجة والزبالة والسراير المش مرتبة والمناشف على الأرض = مش تلف. متسجلهاش.
+- الاستهلاك الطبيعي (احتكاك خفيف، لون باهت، خدش قديم شعرة) = مش تلف. متسجلهاش.
+- لو مش متأكد إن ده تلف فعلاً، سجّله بـ confidence واطية بدل ما تتجاهله.
+- متخترعش حاجات مشوفتهاش. كل نتيجة لازم يكون ليها لحظة حقيقية في الفيديو.
+- التوقيت بصيغة MM:SS.
+
+رجّع JSON بس، من غير أي كلام قبله أو بعده ومن غير علامات كود:
+{
+  "overall": "clean" أو "issues",
+  "summary_ar": "سطر واحد بالعامية المصرية يلخص الحالة",
+  "findings": [
+    {
+      "item": "اسم الحاجة بالعربي",
+      "location": "مكانها في الشقة",
+      "type": "tear" أو "burn" أو "crack" أو "stain" أو "melt" أو "water" أو "missing" أو "other",
+      "description_ar": "وصف قصير بالعامية للي انت شايفه",
+      "timestamp": "MM:SS",
+      "severity": "low" أو "medium" أو "high",
+      "confidence": رقم بين 0 و 1,
+      "claimable": true أو false
+    }
+  ]
+}
+لو الشقة سليمة خالص، رجّع overall = "clean" و findings = [].`;
+}
+
+/* =====================================================================
+   رفع الفيديو على Gemini (resumable) مع نسبة تقدم
+   ===================================================================== */
+function startUpload(file) {
+  return fetch(API + '/upload/v1beta/files', {
+    method : 'POST',
+    headers: {
+      'x-goog-api-key'                  : CONFIG.GEMINI_KEY,
+      'X-Goog-Upload-Protocol'          : 'resumable',
+      'X-Goog-Upload-Command'           : 'start',
+      'X-Goog-Upload-Header-Content-Length': String(file.size),
+      'X-Goog-Upload-Header-Content-Type'  : file.type || 'video/mp4',
+      'Content-Type'                    : 'application/json'
+    },
+    body: JSON.stringify({ file: { display_name: file.name || 'walkthrough' } })
+  }).then(res => {
+    const url = res.headers.get('x-goog-upload-url');
+    if (!url) throw new Error('الرفع مبدأش — راجع مفتاح Gemini');
+    return url;
+  });
+}
+
+function sendBytes(uploadUrl, file, onProgress) {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open('POST', uploadUrl, true);
+    xhr.setRequestHeader('X-Goog-Upload-Offset', '0');
+    xhr.setRequestHeader('X-Goog-Upload-Command', 'upload, finalize');
+
+    xhr.upload.onprogress = e => {
+      if (e.lengthComputable) onProgress(Math.round(e.loaded / e.total * 100));
+    };
+    xhr.onerror = () => reject(new Error('الرفع اتقطع — راجع النت'));
+    xhr.onload  = () => {
+      if (xhr.status < 200 || xhr.status >= 300) return reject(new Error('الرفع فشل (' + xhr.status + ')'));
+      try { resolve(JSON.parse(xhr.responseText).file); }
+      catch (e) { reject(new Error('رد الرفع مش مفهوم')); }
+    };
+    xhr.send(file);
+  });
+}
+
+async function waitActive(name) {
+  for (let i = 0; i < 60; i++) {
+    const r = await fetch(API + '/v1beta/' + name, {
+      headers: { 'x-goog-api-key': CONFIG.GEMINI_KEY }
+    });
+    const f = await r.json();
+    if (f.state === 'ACTIVE') return f;
+    if (f.state === 'FAILED') throw new Error('Gemini مقدرش يقرا الفيديو');
+    await new Promise(r => setTimeout(r, 4000));
+  }
+  throw new Error('الفيديو أخد وقت أطول من اللازم');
+}
+
+/* =====================================================================
+   التحليل
+   ===================================================================== */
+async function analyze(fileUri, mime, prompt) {
+  const videoPart = {
+    type      : 'video',
+    uri       : fileUri,
+    mime_type : mime || 'video/mp4',
+    processing: { type: 'static', fps: CONFIG.FPS }
+  };
+  if (CONFIG.MEDIA_RES) videoPart.media_resolution = CONFIG.MEDIA_RES;
+
+  const res = await fetch(API + '/v1beta/interactions', {
+    method : 'POST',
+    headers: { 'x-goog-api-key': CONFIG.GEMINI_KEY, 'Content-Type': 'application/json' },
+    body   : JSON.stringify({
+      model: CONFIG.MODEL,
+      input: [videoPart, { type: 'text', text: prompt }]
+    })
+  });
+
+  const data = await res.json();
+  if (data.error) throw new Error(data.error.message || 'Gemini رجّع إيرور');
+
+  let text = data.output_text || '';
+  if (!text && Array.isArray(data.steps)) {
+    data.steps.forEach(st => {
+      if (Array.isArray(st.content)) {
+        st.content.forEach(c => { if (c && c.text) text += c.text; });
+      }
+    });
+  }
+
+  const s = text.indexOf('{'), e = text.lastIndexOf('}');
+  if (s < 0 || e < 0) throw new Error('الرد مرجعش JSON');
+  return JSON.parse(text.slice(s, e + 1));
+}
+
+/* =====================================================================
+   التشغيل
+   ===================================================================== */
+$('pick').onclick = () => {
+  if (!$('apt').value) { alert('اختار الشقة الأول'); return; }
+  $('file').click();
+};
+
+$('file').onchange = async e => {
+  const file = e.target.files && e.target.files[0];
+  if (!file) return;
+  run(file);
+};
+
+function setStatus(msg, pct, isErr) {
+  $('status').classList.add('on');
+  $('statText').textContent = msg;
+  $('statText').classList.toggle('err', !!isErr);
+  $('statBar').style.width = (pct == null ? 0 : pct) + '%';
+}
+
+async function run(file) {
+  const apt = apts.find(a => a.apt_id === $('apt').value);
+
+  $('result').classList.remove('on');
+  $('saveRow').classList.remove('on');
+  $('pick').disabled = true;
+
+  const player = $('player');
+  player.src = URL.createObjectURL(file);
+  player.classList.add('on');
+
+  try {
+    setStatus('بيرفع الفيديو…', 0);
+    const uploadUrl = await startUpload(file);
+    const meta      = await sendBytes(uploadUrl, file, p => setStatus('بيرفع الفيديو… ' + p + '%', p));
+
+    setStatus('Gemini بيجهّز الفيديو…', 100);
+    const ready = await waitActive(meta.name);
+
+    setStatus('بيفحص كل ثانية في الفيديو…', 100);
+    const out = await analyze(ready.uri, ready.mimeType || file.type, buildPrompt(apt));
+
+    overall  = out.overall || 'issues';
+    summary  = out.summary_ar || '';
+    findings = (out.findings || []).map((f, i) => ({ ...f, n: i + 1, keep: true }));
+
+    $('status').classList.remove('on');
+    render();
+  } catch (err) {
+    setStatus(err.message || 'حصلت مشكلة', 0, true);
+  } finally {
+    $('pick').disabled = false;
+    $('file').value = '';
+  }
+}
+
+/* =====================================================================
+   العرض
+   ===================================================================== */
+const SEV = { high: 'خطير', medium: 'متوسط', low: 'بسيط' };
+
+function render() {
+  const v = $('verdict');
+  v.className = 'verdict ' + (overall === 'clean' ? 'clean' : 'issues');
+  v.innerHTML = overall === 'clean'
+    ? `<strong>الشقة سليمة</strong><p>${summary || 'مفيش تلف ظاهر في الفيديو.'}</p>`
+    : `<strong>${findings.length} حاجة محتاجة نظرة</strong><p>${summary || ''}</p>`;
+
+  $('list').innerHTML = findings.map(f => `
+    <li class="f ${f.severity || 'low'}" data-n="${f.n}">
+      <span class="dot">${f.n}</span>
+      <div class="box">
+        <div class="head">
+          <span class="what">${esc(f.item || 'حاجة')}</span>
+          <button class="ts" data-ts="${esc(f.timestamp || '')}">▶ ${esc(f.timestamp || '--:--')}</button>
+        </div>
+        <div class="where">${esc(f.location || '')}</div>
+        <p class="desc">${esc(f.description_ar || '')}</p>
+        <div class="meta">${SEV[f.severity] || '—'} · ثقة ${Math.round((f.confidence || 0) * 100)}%${f.claimable ? ' · يستاهل كيس' : ''}</div>
+        <div class="acts">
+          <button data-act="keep" aria-pressed="true">أكّدته</button>
+          <button data-act="drop" aria-pressed="false">مش تلف</button>
+        </div>
+      </div>
+    </li>`).join('');
+
+  $('result').classList.add('on');
+  $('saveRow').classList.add('on');
+}
+
+function esc(s) {
+  return String(s == null ? '' : s)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+/* نقرة على التوقيت = الفيديو يروح عند اللحظة دي */
+$('list').addEventListener('click', ev => {
+  const ts = ev.target.closest('.ts');
+  if (ts) {
+    const [m, s] = (ts.dataset.ts || '0:0').split(':').map(Number);
+    const p = $('player');
+    p.currentTime = Math.max(0, (m || 0) * 60 + (s || 0) - 1);
+    p.play();
+    p.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    return;
+  }
+
+  const act = ev.target.closest('[data-act]');
+  if (!act) return;
+
+  const li = act.closest('.f');
+  const f  = findings.find(x => x.n === Number(li.dataset.n));
+  f.keep   = act.dataset.act === 'keep';
+
+  li.querySelectorAll('[data-act]').forEach(b =>
+    b.setAttribute('aria-pressed', b.dataset.act === act.dataset.act));
+  li.classList.toggle('off', !f.keep);
+});
+
+/* =====================================================================
+   الحفظ
+   ===================================================================== */
+$('save').onclick = async () => {
+  const kept = findings.filter(f => f.keep);
+  const apt  = apts.find(a => a.apt_id === $('apt').value) || {};
+  const rank = { low: 1, medium: 2, high: 3 };
+  const max  = kept.reduce((a, f) => (rank[f.severity] || 0) > (rank[a] || 0) ? f.severity : a, '');
+
+  const compact = kept.map(f =>
+    `[${f.timestamp}] ${f.item} — ${f.location} — ${String(f.description_ar || '').slice(0, 110)} (${SEV[f.severity] || ''})`
+  ).join(' | ');
+
+  $('save').disabled = true;
+  $('save').textContent = 'بيحفظ…';
+
+  try {
+    const r = await jsonp({
+      action        : 'save',
+      apt_id        : apt.apt_id || '',
+      apt_name      : apt.apt_name || '',
+      stage         : stage === 'checkout' ? 'بعد خروج الجيست' : 'تسليم للجديد',
+      booking_ref   : $('ref').value || '',
+      overall       : kept.length ? 'فيه تلف' : 'سليمة',
+      findings_count: String(kept.length),
+      max_severity  : SEV[max] || '',
+      findings      : compact.slice(0, 1400),
+      by            : CONFIG.BY
+    });
+    if (!r.ok) throw new Error(r.error);
+    $('save').textContent = 'اتحفظ ✓';
+  } catch (e) {
+    $('save').disabled = false;
+    $('save').textContent = 'احفظ التقرير';
+    alert('الحفظ مظبطش: ' + e.message);
+  }
+};
+
+$('again').onclick = () => {
+  findings = [];
+  $('result').classList.remove('on');
+  $('saveRow').classList.remove('on');
+  $('player').classList.remove('on');
+  $('save').disabled = false;
+  $('save').textContent = 'احفظ التقرير';
+  $('pick').click();
+};
+</script>
+</body>
+</html>

@@ -119,6 +119,12 @@ video.on{display:block}
 .verdict strong{display:block;font-size:17px;margin-bottom:4px}
 .verdict p{margin:0;font-size:14px}
 
+.gap{
+  background:var(--amber-soft);border:1px solid var(--amber);border-radius:var(--r);
+  padding:10px 14px;margin-bottom:14px;font-size:13px;font-weight:600;color:var(--amber);
+}
+.gap[hidden]{display:none}
+
 .findings{list-style:none;margin:0;padding:0;position:relative}
 .findings::before{
   content:"";position:absolute;inset-block:14px auto;bottom:14px;
@@ -274,6 +280,7 @@ video.on{display:block}
 
 <div id="result">
   <div class="verdict" id="verdict"></div>
+  <div class="gap" id="gap" hidden></div>
   <ul class="findings" id="list"></ul>
 </div>
 
@@ -305,6 +312,7 @@ let GEMINI_KEY = '';
    حالة الشاشة
    ===================================================================== */
 let apts = [], stage = 'checkout', findings = [], overall = '', summary = '';
+let auditTotal = 0, auditGap = 0; // عدد بنود قائمة الجرد اللي فعلاً اتفحصت مقابل الإجمالي
 
 const $ = id => document.getElementById(id);
 document.getElementById('who').textContent = CONFIG.BY || '';
@@ -412,33 +420,68 @@ function setStage(v) {
 /* =====================================================================
    البرومبت
    ===================================================================== */
-function formatInventory(items) {
-  if (!items || !items.length) return '';
+/** بتحوّل قائمة الجرد لقائمة برقم (id) ثابت لكل بند — أساس التحقق الإجباري بند-بند */
+function indexInventory(items) {
+  return (items || [])
+    .filter(it => it && it.item)
+    .map((it, i) => ({ id: i + 1, room: (it.room || 'عام').trim(), item: it.item, qty: it.qty || '1' }));
+}
+
+function formatIndexedInventory(indexed) {
+  if (!indexed.length) return '';
   const byRoom = {};
-  items.forEach(it => {
-    const r = (it.room || 'عام').trim();
-    (byRoom[r] = byRoom[r] || []).push(`${it.item}${it.qty && it.qty !== '1' ? ' ×' + it.qty : ''}`);
+  indexed.forEach(it => {
+    (byRoom[it.room] = byRoom[it.room] || []).push(`#${it.id} ${it.item}${it.qty && it.qty !== '1' ? ' ×' + it.qty : ''}`);
   });
   return Object.keys(byRoom)
     .map(room => `[${room}]\n${byRoom[room].join('، ')}`)
     .join('\n');
 }
 
-function buildPrompt(apt, inventory) {
+/** بتقارن رد الموديل (inventory_status) بقائمة الجرد الحقيقية وبتحسب: إيه اللي فعلاً اتفحص، وإيه اللي اتسجل مفقود.
+ *  ده هو التحقق الحقيقي — مش هنصدّق كلام الموديل، هنعد بنفسنا. */
+function auditInventory(statusArr, indexed) {
+  const byId = {};
+  (Array.isArray(statusArr) ? statusArr : []).forEach(s => { if (s && s.id != null) byId[s.id] = s; });
+
+  const missingFindings = [];
+  let covered = 0;
+
+  indexed.forEach(it => {
+    const s = byId[it.id];
+    if (!s) return; // الموديل ماذكرش البند ده خالص — هيتحسب في auditGap
+    covered++;
+    if (s.status === 'missing') {
+      missingFindings.push({
+        item: it.item,
+        location: it.room,
+        type: 'missing',
+        description_ar: `${it.item} مش ظاهر في ${it.room}`,
+        timestamp: '',
+        severity: s.severity || 'medium',
+        confidence: s.confidence != null ? s.confidence : 0.6,
+        claimable: s.severity === 'high'
+      });
+    }
+  });
+
+  return { missingFindings, covered, gap: indexed.length - covered };
+}
+
+function buildPrompt(apt, indexed) {
   const watch = apt && apt.watchlist
     ? `\nحاجات محددة في الشقة دي لازم تتفحص بعناية:\n${apt.watchlist}\n`
     : '';
 
-  const invList = formatInventory(inventory);
+  const invList = formatIndexedInventory(indexed);
   const invBlock = invList
-    ? `\nقائمة محتويات الشقة الرسمية (من نظام الجرد الداخلي — ده المرجع الأساسي لأي حاجة مفقودة):\n${invList}\n
-اكتشاف "حاجة ناقصة" أصعب بكتير من اكتشاف تلف واضح — لازم منهج صارم، ماتستسهلش:
-- روح على القائمة دي بند بند، واحد واحد، من الأول للآخر. ماتقفزش على حاجة ولا تعتمد على انطباع عام إن "كل حاجة شكلها موجودة".
-- لكل بند: دوّر عليه بعناية في المكان (الغرفة) المذكور جنبه في الفيديو أو الصور.
-  • لقيته → امشي للبند اللي بعده.
-  • مش لاقيه، والفيديو/الصور فعلاً وصلت وصوّرت نفس المكان بوضوح → سجّله "missing". لو غرض أساسي (أثاث، جهاز كهربائي، تلفزيون، إضاءة، مرايا) اخطورته high، لو غرض استهلاكي صغير (مناديل، صابون، شامبو، شمعة) اخطورته low.
-  • المكان ده أصلاً ما اتصوّرش في الفيديو أو الصور → متسجلوش missing خالص، قول في الملاحظة إن المكان محتاج يتصور في المرة الجاية.
-- ممنوع تخلّص من غير ما تكون فعلاً راجعت كل بند في القائمة — لو غرض صغير زي ريموت أو كتاب اتشال وانت مركزتش، ده خطأ في مهمتك.
+    ? `\nقائمة محتويات الشقة الرسمية، كل بند له رقم (id) ثابت — ده المرجع الأساسي لأي حاجة مفقودة:\n${invList}\n
+مطلوب منك تتحقق من كل بند في القائمة دي بالرقم، واحد واحد، بالظبط ${indexed.length} بند — وترجعهم كلهم في "inventory_status" من غير ما تسيب ولا واحد:
+- لقيت البند في الفيديو أو الصور → status:"present".
+- مش لاقيه، والفيديو/الصور فعلاً وصلت وصوّرت نفس مكانه بوضوح → status:"missing"، وحدد severity: high لو غرض أساسي (أثاث، جهاز كهربائي، تلفزيون، إضاءة، مرايا)، low لو غرض استهلاكي صغير (مناديل، صابون، شامبو، شمعة).
+- المكان أصلاً ما اتصوّرش خالص في الفيديو أو الصور → status:"unclear" (من غير severity).
+هنعد إحنا بأنفسنا كام بند فعلاً اتفحص، فلو نقصت بند من الرد هيبان — يبقى لازم تجاوب على الـ ${indexed.length} كلهم.
+ممنوع تحط أي بند من القائمة دي جوه findings — المفقود بيتسجل بس جوه inventory_status.
 `
     : '';
 
@@ -470,11 +513,14 @@ ${watch}${invBlock}
 {
   "overall": "clean" أو "issues",
   "summary_ar": "سطر واحد بالعامية المصرية يلخص الحالة",
+  "inventory_status": [
+    { "id": رقم البند من القائمة فوق, "status": "present" أو "missing" أو "unclear", "severity": "low" أو "medium" أو "high" (لو missing بس، وإلا سيبها فاضية), "confidence": رقم بين 0 و 1 }
+  ],
   "findings": [
     {
       "item": "اسم الحاجة بالعربي",
       "location": "مكانها في الشقة",
-      "type": "tear" أو "burn" أو "crack" أو "stain" أو "melt" أو "water" أو "missing" أو "other",
+      "type": "tear" أو "burn" أو "crack" أو "stain" أو "melt" أو "water" أو "other",
       "description_ar": "وصف قصير بالعامية للي انت شايفه",
       "timestamp": "MM:SS",
       "severity": "low" أو "medium" أو "high",
@@ -483,6 +529,7 @@ ${watch}${invBlock}
     }
   ]
 }
+لو مفيش قائمة جرد أصلاً، سيب inventory_status = [].
 لو الشقة سليمة خالص، رجّع overall = "clean" و findings = [].`;
 }
 
@@ -589,38 +636,59 @@ async function analyze(mediaList, prompt) {
 /* =====================================================================
    وضع التجربة — قبل / بعد
    ===================================================================== */
-function buildTestPrompt() {
-  return `دي تجربة لنظام كشف الفروق بين "قبل" و"بعد" لنفس المكان — مفيش شقة ولا قائمة محتويات، بس قارن بعينك.
+/* وضع التجربة بقى شغال بمكالمتين منفصلتين لـ Gemini بدل مكالمة واحدة:
+   1) "الجرد" — يعمل قائمة مرقّمة بكل حاجة شايفها في "قبل" (زي ما بنعمل مع قائمة الجرد الرسمية).
+   2) "التحقق" — ياخد نفس القائمة دي رقم رقم ويتأكد من كل بند فيها جوه "بعد"، وبرضو
+      بيدوّر لوحده على أي حاجة جديدة/متغيرة/تلف. وبعدين إحنا بنعد بأنفسنا كام بند اتفحص فعلاً. */
+function buildCatalogPrompt() {
+  return `دي أول خطوة بس في تجربة كشف فروق قبل/بعد — لسه من غير أي مقارنة.
 
-هتوصلك مجموعتين من الوسائط: مجموعة اتعلّم عليها إنها "قبل" (الحالة الأصلية)، ومجموعة "بعد" (الحالة الحالية اللي عايزين نقارنها بالأول). ممكن كل مجموعة تكون فيها أكتر من فيديو أو صورة.
+اعمل قائمة شاملة بكل غرض واضح شايفه في الوسائط دي، غرفة غرفة. اتأكد إنك مش بس واخد بالك من الحاجات الكبيرة (أثاث، أجهزة، تلفزيون) — دور كمان على الحاجات الصغيرة (مخدات، ريموت كنترول، مصحف أو كتاب، كماليات على الطربيزة، حاجات على الرف). ماتسيبش حاجة، كل حاجة واضحة في الفيديو أو الصور لازم تبقى بند في القائمة.
 
-اكتشاف "حاجة اتشالت" أصعب بكتير من اكتشاف "حاجة جديدة ظهرت" — لازم منهج صارم، اتبع الخطوات دي بالظبط وماتستسهلش:
+رجّع JSON بس، من غير أي كلام قبله أو بعده ومن غير علامات كود:
+{
+  "items": [
+    { "id": رقم تسلسلي يبدأ من 1, "item": "اسم الحاجة بالعربي", "room": "مكانها" }
+  ]
+}`;
+}
 
-الخطوة 1 — قبل ما تقارن أي حاجة: اعمل في دماغك قائمة كاملة بكل غرض واضح شايفه في مجموعة "قبل"، غرفة غرفة. اتأكد إنك مش بس واخد بالك من الحاجات الكبيرة (أثاث، أجهزة، تلفزيون) — دور كمان على الحاجات الصغيرة (مخدات، ريموت كنترول، مصحف أو كتاب، كماليات على الطربيزة، حاجات على الرف). ماتسيبش حاجة من غير ما تحطها في القائمة.
+function buildVerifyPrompt(beforeItems) {
+  const list = beforeItems.map(it => `#${it.id} ${it.item} (${it.room})`).join('\n');
+  return `دي تكملة تجربة كشف فروق قبل/بعد. الوسائط اللي جاية دلوقتي هي مجموعة "بعد".
 
-الخطوة 2 — لكل غرض في القائمة دي، واحد واحد، دوّر عليه بعناية في مجموعة "بعد" في نفس المكان أو قريب منه:
-  • لو لقيته → امشي للي بعده.
-  • لو مش لاقيه، والكاميرا في "بعد" فعلاً وصلت ومرت على نفس المكان بوضوح → ده "missing"، سجّله.
-  • لو الكاميرا في "بعد" أصلاً ما وصلتش لنفس المكان ده خالص → متسجلوش missing، قول في الملاحظة إن المكان محتاج يتصور تاني.
+القائمة دي هي كل حاجة اتشافت في مجموعة "قبل" (من خطوة سابقة)، كل بند برقمه:
+${list}
 
-الخطوة 3 — بعد ما تخلّص الخطوة 1 والخطوة 2 لكل غرض، دوّر على: أي حاجة جديدة ظهرت في "بعد" مكانتش في "قبل"، وأي حاجة اتغيّر مكانها أو وضعها، وأي كسر أو خدش أو تلف أو بقعة ظهرت في "بعد" ومكانتش في "قبل".
+مطلوب منك حاجتين بالترتيب:
+
+1) تتحقق من كل بند في القائمة دي بالرقم، واحد واحد، بالظبط ${beforeItems.length} بند — وترجعهم كلهم في "item_status" من غير ما تسيب ولا واحد:
+   • لقيته في "بعد" في نفس المكان أو قريب منه → status:"present".
+   • مش لاقيه، والوسائط فعلاً وصلت وصوّرت نفس مكانه بوضوح → status:"missing".
+   • المكان أصلاً ما اتصوّرش خالص في "بعد" → status:"unclear".
+   هنعد إحنا بأنفسنا كام بند اتفحص، فلو نقصت بند من الرد هيبان.
+
+2) بعد كده بس، لوحدك، دوّر في "بعد" على: أي حاجة جديدة ظهرت مكانتش في القائمة، أي حاجة اتغيّر مكانها أو وضعها، وأي كسر أو خدش أو تلف أو بقعة.
 
 قواعد:
-- متخترعش فروق مشوفتهاش فعلاً. كل نتيجة لازم يكون ليها دليل واضح في الوسائط.
+- متخترعش حاجة مشفتهاش فعلاً. كل نتيجة لازم يكون ليها دليل واضح في الوسائط.
 - لو مش متأكد، سجّله بـ confidence واطية بدل ما تتجاهله.
-- ممنوع تقول "كله موجود ومفيش حاجة ناقصة" من غير ما تكون فعلاً عملت الخطوة 1 والخطوة 2 لكل غرض شايفه في "قبل" — لو في غرض صغير اتشال وانت مركزش، ده خطأ في مهمتك.
-- في description_ar وضّح إن ده لاحظته في مجموعة "قبل" ولا "بعد"، وسيب timestamp فاضي دايمًا (عندنا أكتر من فيديو فمش هيبقى واضح توقيته لوحده).
+- ممنوع تحط أي بند من القائمة دي جوه findings — المفقود بيتسجل بس جوه item_status.
+- في description_ar وضّح إن ده جديد ولا اتغيّر مكانه ولا تلف، وسيب timestamp فاضي دايمًا.
 
 رجّع JSON بس، من غير أي كلام قبله أو بعده ومن غير علامات كود:
 {
   "overall": "clean" أو "issues",
   "summary_ar": "سطر واحد بالعامية المصرية يلخص الفرق الرئيسي",
+  "item_status": [
+    { "id": رقم من القائمة فوق, "status": "present" أو "missing" أو "unclear", "confidence": رقم بين 0 و 1 }
+  ],
   "findings": [
     {
       "item": "اسم الحاجة بالعربي",
       "location": "مكانها",
-      "type": "tear" أو "burn" أو "crack" أو "stain" أو "melt" أو "water" أو "missing" أو "added" أو "moved" أو "other",
-      "description_ar": "وصف قصير بالعامية، موضّح فيه (من قبل) أو (من بعد)",
+      "type": "tear" أو "burn" أو "crack" أو "stain" أو "melt" أو "water" أو "added" أو "moved" أو "other",
+      "description_ar": "وصف قصير بالعامية",
       "timestamp": "",
       "severity": "low" أو "medium" أو "high",
       "confidence": رقم بين 0 و 1,
@@ -634,6 +702,7 @@ function buildTestPrompt() {
 async function runTestMode(beforeFiles, afterFiles) {
   if (!beforeFiles.length || !afterFiles.length) { alert('اختار وسائط "قبل" و"بعد" الأول'); return; }
 
+  auditTotal = 0; auditGap = 0;
   $('result').classList.remove('on');
   $('saveRow').classList.remove('on');
   $('runTest').disabled = true;
@@ -658,19 +727,24 @@ async function runTestMode(beforeFiles, afterFiles) {
       (grp === 'قبل' ? beforeMedia : afterMedia).push(u);
     }
 
-    setStatus('بيقارن قبل وبعد…', 100);
-    const parts = [
-      { type: 'text', text: 'الوسائط الجاية دي مجموعة "قبل" — الحالة الأصلية:' },
-      ...mediaToParts(beforeMedia),
+    setStatus('بيعمل قائمة بكل حاجة في "قبل"…', 90);
+    const catalog = await callGemini([...mediaToParts(beforeMedia), { type: 'text', text: buildCatalogPrompt() }]);
+    const beforeItems = Array.isArray(catalog.items) ? catalog.items.filter(it => it && it.id != null && it.item) : [];
+
+    setStatus(`بيتحقق من ${beforeItems.length} بند في "بعد"…`, 95);
+    const verify = await callGemini([
       { type: 'text', text: 'الوسائط الجاية دي مجموعة "بعد" — الحالة الحالية اللي هنقارنها بالأول:' },
       ...mediaToParts(afterMedia),
-      { type: 'text', text: buildTestPrompt() }
-    ];
-    const out = await callGemini(parts);
+      { type: 'text', text: buildVerifyPrompt(beforeItems) }
+    ]);
 
-    overall  = out.overall || 'issues';
-    summary  = out.summary_ar || '';
-    findings = (out.findings || []).map((f, i) => ({ ...f, n: i + 1, keep: true }));
+    const audit = auditInventory(verify.item_status, beforeItems.map(it => ({ id: it.id, item: it.item, room: it.room })));
+    auditTotal  = beforeItems.length;
+    auditGap    = audit.gap;
+
+    overall  = verify.overall || (audit.missingFindings.length ? 'issues' : 'clean');
+    summary  = verify.summary_ar || '';
+    findings = [...audit.missingFindings, ...(verify.findings || [])].map((f, i) => ({ ...f, n: i + 1, keep: true }));
 
     $('status').classList.remove('on');
     render(true);
@@ -751,6 +825,7 @@ async function uploadOneFile(file, onProgress) {
 async function run(files) {
   const apt = apts.find(a => a.apt_id === $('apt').value);
 
+  auditTotal = 0; auditGap = 0;
   $('result').classList.remove('on');
   $('saveRow').classList.remove('on');
   $('pick').disabled = true;
@@ -778,13 +853,18 @@ async function run(files) {
 
     const invRes    = await invPromise;
     const inventory = (invRes && invRes.ok) ? (invRes.items || []) : [];
+    const indexed   = indexInventory(inventory);
 
     setStatus('بيفحص كل حاجة…', 100);
-    const out = await analyze(uploaded, buildPrompt(apt, inventory));
+    const out = await analyze(uploaded, buildPrompt(apt, indexed));
 
-    overall  = out.overall || 'issues';
+    const audit = auditInventory(out.inventory_status, indexed);
+    auditTotal  = indexed.length;
+    auditGap    = audit.gap;
+
+    overall  = out.overall || (audit.missingFindings.length ? 'issues' : 'clean');
     summary  = out.summary_ar || '';
-    findings = (out.findings || []).map((f, i) => ({ ...f, n: i + 1, keep: true }));
+    findings = [...audit.missingFindings, ...(out.findings || [])].map((f, i) => ({ ...f, n: i + 1, keep: true }));
 
     $('status').classList.remove('on');
     render();
@@ -811,6 +891,13 @@ function render(isTest) {
     : (isTest
         ? `<strong>${findings.length} فرق بين قبل وبعد</strong><p>${summary || ''}</p>`
         : `<strong>${findings.length} حاجة محتاجة نظرة</strong><p>${summary || ''}</p>`);
+
+  if (auditTotal > 0 && auditGap > 0) {
+    $('gap').hidden = false;
+    $('gap').textContent = `⚠️ اتفحص ${auditTotal - auditGap} من ${auditTotal} بند بس من ${isTest ? 'اللي شفناه في "قبل"' : 'قائمة الجرد'} — الباقي (${auditGap}) محتاج تتأكد منه بعينك.`;
+  } else {
+    $('gap').hidden = true;
+  }
 
   $('list').innerHTML = findings.map(f => `
     <li class="f ${f.severity || 'low'}" data-n="${f.n}">
@@ -903,6 +990,7 @@ $('save').onclick = async () => {
 
 $('again').onclick = () => {
   findings = [];
+  auditTotal = 0; auditGap = 0;
   $('result').classList.remove('on');
   $('saveRow').classList.remove('on');
   $('player').classList.remove('on');

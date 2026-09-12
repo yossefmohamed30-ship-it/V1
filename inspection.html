@@ -296,11 +296,13 @@ video.on{display:block}
    الإعدادات — غيّر التلاتة دول بس
    ===================================================================== */
 const CONFIG = {
-  SCRIPT_URL : 'https://script.google.com/macros/s/AKfycbz_v-JJlXjzgliDZKdahRkZ7xADNvuUbjqgiHT1pcrt9ZPeOLlsbL3_UcfaHCPLv8k/exec',
-  MODEL      : 'gemini-3.6-flash',
-  FPS        : 2,          // فريمين في الثانية — أدق للتفاصيل الصغيرة
-  MEDIA_RES  : '',         // مش مدعومة حاليًا في الـ API — سيبها فاضية
-  BY         : ''          // اسم اللي بيستلم (اختياري)
+  SCRIPT_URL     : 'https://script.google.com/macros/s/AKfycbz_v-JJlXjzgliDZKdahRkZ7xADNvuUbjqgiHT1pcrt9ZPeOLlsbL3_UcfaHCPLv8k/exec',
+  MODEL          : 'gemini-3.6-flash',
+  FPS            : 2,          // فريمين في الثانية — أدق للتفاصيل الصغيرة
+  MEDIA_RES      : '',         // مش مدعومة حاليًا في الـ API — سيبها فاضية
+  BY             : '',         // اسم اللي بيستلم (اختياري)
+  INV_CHUNK_SIZE : 25,         // كام بند نبعت للموديل في كل مكالمة — قليل عمدًا عشان يفحص كل بند فعلاً بدل ما يلخّص
+  INV_CONCURRENCY: 3           // كام مكالمة تشتغل في نفس الوقت وهو بيدور على دفعات الجرد
 };
 
 const API = 'https://generativelanguage.googleapis.com';
@@ -427,15 +429,27 @@ function indexInventory(items) {
     .map((it, i) => ({ id: i + 1, room: (it.room || 'عام').trim(), item: it.item, qty: it.qty || '1' }));
 }
 
-function formatIndexedInventory(indexed) {
-  if (!indexed.length) return '';
-  const byRoom = {};
-  indexed.forEach(it => {
-    (byRoom[it.room] = byRoom[it.room] || []).push(`#${it.id} ${it.item}${it.qty && it.qty !== '1' ? ' ×' + it.qty : ''}`);
-  });
-  return Object.keys(byRoom)
-    .map(room => `[${room}]\n${byRoom[room].join('، ')}`)
-    .join('\n');
+/** بتقسّم قائمة طويلة لدفعات صغيرة — كل دفعة بتتبعت في مكالمة منفصلة للموديل
+ *  عشان يتحقق منها واحد واحد بدل ما يتلخّص في قائمة كبيرة قدامه. */
+function chunkArray(arr, size) {
+  const out = [];
+  for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
+  return out;
+}
+
+/** بتشغّل مجموعة مهام async بحد أقصى لعدد اللي بيشتغلوا في نفس الوقت، بدل ما تستنى كل واحدة لوحدها
+ *  أو تطلقهم كلهم مرة واحدة (وده ممكن يضرب حد الـ rate limit بتاع الـ API). */
+async function runWithConcurrency(taskFns, limit) {
+  const results = new Array(taskFns.length);
+  let next = 0;
+  async function worker() {
+    while (next < taskFns.length) {
+      const i = next++;
+      results[i] = await taskFns[i]();
+    }
+  }
+  await Promise.all(Array.from({ length: Math.max(1, Math.min(limit, taskFns.length)) }, worker));
+  return results;
 }
 
 /** بتقارن رد الموديل (inventory_status) بقائمة الجرد الحقيقية وبتحسب: إيه اللي فعلاً اتفحص، وإيه اللي اتسجل مفقود.
@@ -468,21 +482,11 @@ function auditInventory(statusArr, indexed) {
   return { missingFindings, covered, gap: indexed.length - covered };
 }
 
-function buildPrompt(apt, indexed) {
+/** برومبت التلف — مكالمة واحدة بس على الفيديو كله، من غير أي علاقة بقائمة الجرد.
+ *  فصلناه عن فحص الجرد عشان مقارنة التلف مش محتاجة تتقسّم لدفعات زي الجرد. */
+function buildDamagePrompt(apt) {
   const watch = apt && apt.watchlist
     ? `\nحاجات محددة في الشقة دي لازم تتفحص بعناية:\n${apt.watchlist}\n`
-    : '';
-
-  const invList = formatIndexedInventory(indexed);
-  const invBlock = invList
-    ? `\nقائمة محتويات الشقة الرسمية، كل بند له رقم (id) ثابت — ده المرجع الأساسي لأي حاجة مفقودة:\n${invList}\n
-مطلوب منك تتحقق من كل بند في القائمة دي بالرقم، واحد واحد، بالظبط ${indexed.length} بند — وترجعهم كلهم في "inventory_status" من غير ما تسيب ولا واحد:
-- لقيت البند في الفيديو أو الصور → status:"present".
-- مش لاقيه، والفيديو/الصور فعلاً وصلت وصوّرت نفس مكانه بوضوح → status:"missing"، وحدد severity: high لو غرض أساسي (أثاث، جهاز كهربائي، تلفزيون، إضاءة، مرايا)، low لو غرض استهلاكي صغير (مناديل، صابون، شامبو، شمعة).
-- المكان أصلاً ما اتصوّرش خالص في الفيديو أو الصور → status:"unclear" (من غير severity).
-هنعد إحنا بأنفسنا كام بند فعلاً اتفحص، فلو نقصت بند من الرد هيبان — يبقى لازم تجاوب على الـ ${indexed.length} كلهم.
-ممنوع تحط أي بند من القائمة دي جوه findings — المفقود بيتسجل بس جوه inventory_status.
-`
     : '';
 
   const job = stage === 'checkout'
@@ -492,7 +496,7 @@ function buildPrompt(apt, indexed) {
 مهمتك: تتأكد إن الشقة جاهزة للتسليم — أي تلف باقي، أي حاجة مكسورة أو مبقعة، أو أي حاجة واضح إنها ناقصة أو مش في مكانها.`;
 
   return `${job}
-${watch}${invBlock}
+${watch}
 دوّر بالتحديد على:
 - قطع أو خدش أو تقشير في الجلد والقماش (خصوصًا على الكنب والكراسي)
 - حرق أو انصهار في البلاستيك أو الخشب أو الرخام
@@ -508,14 +512,12 @@ ${watch}${invBlock}
 - متخترعش حاجات مشوفتهاش. كل نتيجة لازم يكون ليها دليل حقيقي في الوسائط اللي بعتهالك (فيديو أو صورة).
 - ممكن يوصلك أكتر من فيديو و/أو أكتر من صورة للشقة نفسها — عاملهم كلهم كدليل واحد شامل للشقة.
 - لو الدليل من فيديو: حط التوقيت بصيغة MM:SS في timestamp. لو الدليل من صورة (مفيهاش توقيت أصلاً): سيب timestamp فاضي وقول في location/description إن المصدر صورة.
+- متسجلش أي حاجة "ناقصة" هنا خالص — المفقود بيتفحص في مكالمة منفصلة، ركّز إنت بس على التلف.
 
 رجّع JSON بس، من غير أي كلام قبله أو بعده ومن غير علامات كود:
 {
   "overall": "clean" أو "issues",
-  "summary_ar": "سطر واحد بالعامية المصرية يلخص الحالة",
-  "inventory_status": [
-    { "id": رقم البند من القائمة فوق, "status": "present" أو "missing" أو "unclear", "severity": "low" أو "medium" أو "high" (لو missing بس، وإلا سيبها فاضية), "confidence": رقم بين 0 و 1 }
-  ],
+  "summary_ar": "سطر واحد بالعامية المصرية يلخص حالة التلف",
   "findings": [
     {
       "item": "اسم الحاجة بالعربي",
@@ -529,8 +531,32 @@ ${watch}${invBlock}
     }
   ]
 }
-لو مفيش قائمة جرد أصلاً، سيب inventory_status = [].
 لو الشقة سليمة خالص، رجّع overall = "clean" و findings = [].`;
+}
+
+/** برومبت دفعة من قائمة الجرد — بيتبعت لنفس الفيديو أكتر من مرة، كل مرة بدفعة صغيرة من البنود بس
+ *  (CONFIG.INV_CHUNK_SIZE) عشان الموديل يقدر يتحقق منها واحد واحد فعليًا بدل ما يلخّص قائمة كبيرة. */
+function buildInventoryChunkPrompt(chunk) {
+  const list = chunk
+    .map(it => `#${it.id} ${it.item} — ${it.room}${it.qty && it.qty !== '1' ? ' ×' + it.qty : ''}`)
+    .join('\n');
+
+  return `مطلوب منك تتحقق من البنود دي بس من قائمة جرد شقة (${chunk.length} بند)، واحد واحد بالرقم، من الفيديو أو الصور اللي وصلتك — من غير ما تلخّص أو تستسهل:
+${list}
+
+لكل بند:
+- لقيته في مكانه (الغرفة المذكورة جنبه) → status:"present".
+- مش لاقيه، والفيديو/الصور فعلاً وصلت وصوّرت نفس مكانه بوضوح → status:"missing"، وحدد severity: high لو غرض أساسي (أثاث، جهاز كهربائي، تلفزيون، إضاءة، مرايا)، low لو غرض استهلاكي صغير (مناديل، صابون، شامبو، شمعة).
+- المكان أصلاً ما اتصوّرش خالص → status:"unclear" (من غير severity).
+
+لازم ترجع بالظبط ${chunk.length} عنصر في inventory_status، واحد لكل رقم فوق بالترتيب، من غير ما تسيب ولا واحد.
+
+رجّع JSON بس، من غير أي كلام قبله أو بعده ومن غير علامات كود:
+{
+  "inventory_status": [
+    { "id": رقم البند من القائمة فوق, "status": "present" أو "missing" أو "unclear", "severity": "low" أو "medium" أو "high" (لو missing بس، وإلا سيبها فاضية), "confidence": رقم بين 0 و 1 }
+  ]
+}`;
 }
 
 /* =====================================================================
@@ -854,16 +880,37 @@ async function run(files) {
     const invRes    = await invPromise;
     const inventory = (invRes && invRes.ok) ? (invRes.items || []) : [];
     const indexed   = indexInventory(inventory);
+    const chunks    = chunkArray(indexed, CONFIG.INV_CHUNK_SIZE);
 
-    setStatus('بيفحص كل حاجة…', 100);
-    const out = await analyze(uploaded, buildPrompt(apt, indexed));
+    setStatus(chunks.length ? `بيفحص التلف، وبيتحقق من ${indexed.length} بند في الجرد (${chunks.length} دفعة)…` : 'بيفحص التلف…', 100);
 
-    const audit = auditInventory(out.inventory_status, indexed);
+    // مكالمة التلف مستقلة تمامًا، وبتشتغل جنب دفعات الجرد مش بعدها
+    const damagePromise = analyze(uploaded, buildDamagePrompt(apt));
+
+    let chunkResults = [];
+    if (chunks.length) {
+      let done = 0;
+      const tasks = chunks.map(chunk => async () => {
+        const r = await analyze(uploaded, buildInventoryChunkPrompt(chunk));
+        done++;
+        setStatus(`بيتحقق من الجرد… دفعة ${done} من ${chunks.length}`, 100);
+        return Array.isArray(r.inventory_status) ? r.inventory_status : [];
+      });
+      chunkResults = await runWithConcurrency(tasks, CONFIG.INV_CONCURRENCY);
+    }
+
+    const mergedStatus = [].concat(...chunkResults);
+    const audit = auditInventory(mergedStatus, indexed);
     auditTotal  = indexed.length;
     auditGap    = audit.gap;
 
-    overall  = out.overall || (audit.missingFindings.length ? 'issues' : 'clean');
+    const out = await damagePromise;
+
+    overall  = (out.overall === 'issues' || audit.missingFindings.length) ? 'issues' : (out.overall || 'clean');
     summary  = out.summary_ar || '';
+    if (audit.missingFindings.length) {
+      summary = summary ? `${summary} + ${audit.missingFindings.length} حاجة ناقصة من الجرد` : `${audit.missingFindings.length} حاجة ناقصة من الجرد`;
+    }
     findings = [...audit.missingFindings, ...(out.findings || [])].map((f, i) => ({ ...f, n: i + 1, keep: true }));
 
     $('status').classList.remove('on');

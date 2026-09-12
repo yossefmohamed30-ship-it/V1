@@ -319,7 +319,8 @@ const CONFIG = {
   MAX_FRAMES     : 16,         // أقصى عدد فريمات ناخدها من كل فيديو (موزّعين بالتساوي على طول الفيديو) — لو الوسائط صور بس، مش بتتفعّل خالص
   FRAME_MAX_DIM  : 1024,       // أقصى بعد للصورة (عرض أو ارتفاع) بعد الضغط — عشان الحجم يفضل معقول
   JPEG_QUALITY   : 0.75,
-  INV_CONCURRENCY: 2           // كام بند من الجرد بيتفحص في نفس الوقت — قليل عمدًا عشان منضربش rate limit بتاع Replicate
+  INV_CONCURRENCY: 2,          // كام بند من الجرد بيتفحص في نفس الوقت — قليل عمدًا عشان منضربش rate limit بتاع Replicate
+  COUNT_FRAMES_MAX: 6          // لبنود العدّ (qty>1): كام زاوية/فريم نفحص بيهم عشان نمسك حاجة متخبّية في زاوية وظاهرة في تانية
 };
 
 /* بنستخدم endpoint الرسمي والمستقر generateContent بدل الـ Interactions API القديمة —
@@ -650,6 +651,29 @@ async function checkItemPresence(compositeB64, itemNameEn, tries) {
     }
   }
   return 'unclear';
+}
+
+/** بنود العدّ (qty > 1 زي المخدات) محتاجة حل مختلف تمامًا عن present/missing —
+ *  التداخل بيخبّي حاجة في زاوية واحدة وبتبان في زاوية تانية. فبدل ما نفحص صورة واحدة مجمّعة،
+ *  بنفحص كل زاوية/فريم لوحده على حدة (Gemini بيعدّ بعينه)، وناخد أعلى عدد ظهر — ده أقرب تقدير حقيقي. */
+async function countItemInFrames(frames, itemNameAr, maxFrames) {
+  const sample = frames.slice(0, maxFrames);
+  let maxCount = 0;
+
+  for (const b64 of sample) {
+    try {
+      const prompt = `عدّ بالظبط كام "${itemNameAr}" شايفهم في الصورة دي — واحد واحد، من غير تخمين.
+لو مش شايف ولا واحد، رجّع 0. لو مش قادر تحدد بدقة، رجّع أقل عدد أنت متأكد منه.
+رجّع JSON بس: { "count": رقم صحيح }`;
+      const out = await callGemini([{ inline_data: { mime_type: 'image/jpeg', data: b64 } }, { text: prompt }]);
+      const n = Number(out.count);
+      if (!isNaN(n) && n > maxCount) maxCount = n;
+    } catch (e) {
+      // فريم واحد فشل؟ نكمّل الباقي، ماتوقفش الفحص كله عشانه
+    }
+  }
+
+  return maxCount;
 }
 
 /* =====================================================================
@@ -1071,23 +1095,27 @@ async function run(filesOrFrames, alreadyFrames) {
     const inventory = (invRes && invRes.ok) ? (invRes.items || []) : [];
     const indexed   = indexInventory(inventory);
 
-    setStatus(indexed.length ? `بيفحص التلف، وبيتحقق من ${indexed.length} بند في الجرد بالـ detector…` : 'بيفحص التلف…', 30);
+    // بنود العدّ (qty > 1، زي المخدات) محتاجة عدّ فعلي متعدد الزوايا — مش سؤال "موجود ولا لأ" بس
+    const countItems  = indexed.filter(it => Number(it.qty) > 1);
+    const simpleItems = indexed.filter(it => !(Number(it.qty) > 1));
 
-    // مكالمة التلف مستقلة تمامًا (Gemini، وصف حالة)، وبتشتغل جنب فحص الجرد (Grounding DINO + SAM، كشف حقيقي) مش بعده
+    setStatus(indexed.length ? `بيفحص التلف، وبيتحقق من ${indexed.length} بند في الجرد…` : 'بيفحص التلف…', 25);
+
+    // مكالمة التلف مستقلة تمامًا (Gemini، وصف حالة)، وبتشتغل جنب فحص الجرد مش بعده
     const damagePromise = analyze(frames, buildDamagePrompt(apt));
 
     let mergedStatus = [];
-    if (indexed.length) {
+    if (simpleItems.length) {
       const [composite, enMap] = await Promise.all([
         buildCompositeImage(frames),
-        translateItemsToEnglish(indexed)
+        translateItemsToEnglish(simpleItems)
       ]);
 
       let done = 0;
-      const tasks = indexed.map(it => async () => {
+      const tasks = simpleItems.map(it => async () => {
         const status = await checkItemPresence(composite, enMap[it.id] || it.item, 3);
         done++;
-        setStatus(`بيتحقق من الجرد… ${done} من ${indexed.length}`, 30 + Math.round(done / indexed.length * 60));
+        setStatus(`بيتحقق من الجرد… ${done} من ${indexed.length}`, 25 + Math.round(done / indexed.length * 40));
         return {
           id: it.id,
           status,
@@ -1098,18 +1126,43 @@ async function run(filesOrFrames, alreadyFrames) {
       mergedStatus = await runWithConcurrency(tasks, CONFIG.INV_CONCURRENCY);
     }
 
-    const audit = auditInventory(mergedStatus, indexed);
-    auditTotal  = indexed.length;
-    auditGap    = audit.gap;
+    const audit = auditInventory(mergedStatus, simpleItems);
+
+    let countFindings = [];
+    if (countItems.length) {
+      let doneCount = 0;
+      const countTasks = countItems.map(it => async () => {
+        const expected = Number(it.qty);
+        const found = await countItemInFrames(frames, it.item, CONFIG.COUNT_FRAMES_MAX);
+        doneCount++;
+        setStatus(`بيعدّ… ${doneCount} من ${countItems.length}`, 65 + Math.round(doneCount / countItems.length * 30));
+        if (found >= expected) return null;
+        return {
+          item: it.item,
+          location: it.room,
+          type: 'missing',
+          description_ar: `لقينا ${found} من أصل ${expected} — يمكن ${expected - found} ناقص`,
+          timestamp: '',
+          severity: 'medium',
+          confidence: 0.6,
+          claimable: false
+        };
+      });
+      countFindings = (await runWithConcurrency(countTasks, CONFIG.INV_CONCURRENCY)).filter(Boolean);
+    }
+
+    auditTotal = indexed.length;
+    auditGap   = audit.gap; // بنود العدّ بتتفحص دايمًا (أسوأ حالة: يرجع 0)، فمش بتتحسب كـ "فات الفحص"
 
     const out = await damagePromise;
 
-    overall  = (out.overall === 'issues' || audit.missingFindings.length) ? 'issues' : (out.overall || 'clean');
+    const allMissing = [...audit.missingFindings, ...countFindings];
+    overall  = (out.overall === 'issues' || allMissing.length) ? 'issues' : (out.overall || 'clean');
     summary  = out.summary_ar || '';
-    if (audit.missingFindings.length) {
-      summary = summary ? `${summary} + ${audit.missingFindings.length} حاجة ناقصة من الجرد` : `${audit.missingFindings.length} حاجة ناقصة من الجرد`;
+    if (allMissing.length) {
+      summary = summary ? `${summary} + ${allMissing.length} حاجة ناقصة من الجرد` : `${allMissing.length} حاجة ناقصة من الجرد`;
     }
-    findings = [...audit.missingFindings, ...(out.findings || [])].map((f, i) => ({ ...f, n: i + 1, keep: true }));
+    findings = [...allMissing, ...(out.findings || [])].map((f, i) => ({ ...f, n: i + 1, keep: true }));
 
     $('status').classList.remove('on');
     render();

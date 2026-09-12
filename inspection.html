@@ -319,8 +319,7 @@ const CONFIG = {
   MAX_FRAMES     : 16,         // أقصى عدد فريمات ناخدها من كل فيديو (موزّعين بالتساوي على طول الفيديو) — لو الوسائط صور بس، مش بتتفعّل خالص
   FRAME_MAX_DIM  : 1024,       // أقصى بعد للصورة (عرض أو ارتفاع) بعد الضغط — عشان الحجم يفضل معقول
   JPEG_QUALITY   : 0.75,
-  INV_CHUNK_SIZE : 25,         // كام بند نبعت للموديل في كل مكالمة — قليل عمدًا عشان يفحص كل بند فعلاً بدل ما يلخّص
-  INV_CONCURRENCY: 3           // كام مكالمة تشتغل في نفس الوقت وهو بيدور على دفعات الجرد
+  INV_CONCURRENCY: 2           // كام بند من الجرد بيتفحص في نفس الوقت — قليل عمدًا عشان منضربش rate limit بتاع Replicate
 };
 
 /* بنستخدم endpoint الرسمي والمستقر generateContent بدل الـ Interactions API القديمة —
@@ -449,14 +448,6 @@ function indexInventory(items) {
     .map((it, i) => ({ id: i + 1, room: (it.room || 'عام').trim(), item: it.item, qty: it.qty || '1' }));
 }
 
-/** بتقسّم قائمة طويلة لدفعات صغيرة — كل دفعة بتتبعت في مكالمة منفصلة للموديل
- *  عشان يتحقق منها واحد واحد بدل ما يتلخّص في قائمة كبيرة قدامه. */
-function chunkArray(arr, size) {
-  const out = [];
-  for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
-  return out;
-}
-
 /** بتشغّل مجموعة مهام async بحد أقصى لعدد اللي بيشتغلوا في نفس الوقت، بدل ما تستنى كل واحدة لوحدها
  *  أو تطلقهم كلهم مرة واحدة (وده ممكن يضرب حد الـ rate limit بتاع الـ API). */
 async function runWithConcurrency(taskFns, limit) {
@@ -472,8 +463,8 @@ async function runWithConcurrency(taskFns, limit) {
   return results;
 }
 
-/** بتقارن رد الموديل (inventory_status) بقائمة الجرد الحقيقية وبتحسب: إيه اللي فعلاً اتفحص، وإيه اللي اتسجل مفقود.
- *  ده هو التحقق الحقيقي — مش هنصدّق كلام الموديل، هنعد بنفسنا. */
+/** بتقارن نتيجة الفحص (سواء من detector أو من موديل لغوي) بقائمة الجرد الحقيقية وبتحسب:
+ *  إيه اللي فعلاً اتفحص، وإيه اللي اتسجل مفقود. ده هو التحقق الحقيقي — بنعد بنفسنا مش بنصدّق. */
 function auditInventory(statusArr, indexed) {
   const byId = {};
   (Array.isArray(statusArr) ? statusArr : []).forEach(s => { if (s && s.id != null) byId[s.id] = s; });
@@ -554,29 +545,111 @@ ${watch}
 لو الشقة سليمة خالص، رجّع overall = "clean" و findings = [].`;
 }
 
-/** برومبت دفعة من قائمة الجرد — بيتبعت لنفس الفيديو أكتر من مرة، كل مرة بدفعة صغيرة من البنود بس
- *  (CONFIG.INV_CHUNK_SIZE) عشان الموديل يقدر يتحقق منها واحد واحد فعليًا بدل ما يلخّص قائمة كبيرة. */
-function buildInventoryChunkPrompt(chunk) {
-  const list = chunk
-    .map(it => `#${it.id} ${it.item} — ${it.room}${it.qty && it.qty !== '1' ? ' ×' + it.qty : ''}`)
-    .join('\n');
+/* =====================================================================
+   فحص الجرد الحقيقي — Grounding DINO + SAM (schananas/grounded_sam على Replicate)
+   مش موديل لغوي بيوصف المشهد؛ ده detector بيدوّر فعليًا على اسم الغرض في الصورة
+   ويرجّع نتيجة أكيدة (لقاه / مالقهوش) — مفيش تلخيص ومفيش تخمين.
+   البروكسي (Cloudflare Worker) موجود عشان مشكلة الـ CORS بس، الرمز/المنطق كله هنا.
+   ===================================================================== */
+const REPLICATE_PROXY = 'https://rapid-frog-6b53.yossefmohamed30.workers.dev/';
 
-  return `مطلوب منك تتحقق من البنود دي بس من قائمة جرد شقة (${chunk.length} بند)، واحد واحد بالرقم، من الفيديو أو الصور اللي وصلتك — من غير ما تلخّص أو تستسهل:
+/** بتحمّل صورة base64 كـ Image object عشان نقدر نرسمها على canvas */
+function loadImageFromB64(b64) {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => resolve(img);
+    img.onerror = () => reject(new Error('مقدرش يحمّل الصورة'));
+    img.src = 'data:image/jpeg;base64,' + b64;
+  });
+}
+
+/** بتجمّع كل الفريمات/الصور في صورة واحدة كبيرة (شبكة) — عشان كل بند في الجرد
+ *  يتفحص بمكالمة واحدة بس على الصورة المجمّعة دي، بدل ما نكرر الفحص لكل فريم لوحده. */
+async function buildCompositeImage(frames) {
+  if (!frames.length) return null;
+  const imgs = await Promise.all(frames.map(loadImageFromB64));
+
+  const cols = Math.ceil(Math.sqrt(imgs.length));
+  const rows = Math.ceil(imgs.length / cols);
+  const cellW = 480, cellH = 360;
+
+  const canvas = document.createElement('canvas');
+  canvas.width = cols * cellW;
+  canvas.height = rows * cellH;
+  const ctx = canvas.getContext('2d');
+  ctx.fillStyle = '#000';
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+  imgs.forEach((img, i) => {
+    const col = i % cols, row = Math.floor(i / cols);
+    const scale = Math.min(cellW / img.width, cellH / img.height);
+    const w = img.width * scale, h = img.height * scale;
+    const x = col * cellW + (cellW - w) / 2;
+    const y = row * cellH + (cellH - h) / 2;
+    ctx.drawImage(img, x, y, w, h);
+  });
+
+  return canvasToBase64(canvas);
+}
+
+/** بتترجم أسماء بنود الجرد للإنجليزي مرة واحدة بس لكل الفحص —
+ *  موديلات الـ detection مدرّبة أساسًا بالإنجليزي، فالاسم العربي هيقلل دقة الكشف. */
+async function translateItemsToEnglish(indexed) {
+  if (!indexed.length) return {};
+  const list = indexed.map(it => `${it.id}: ${it.item}`).join('\n');
+  const prompt = `ترجم أسماء الأغراض دي من العربي للإنجليزي، كل واحد كلمة أو كلمتين بسيطة تناسب موديل كشف أجسام (زي "quran" أو "ac remote" أو "leather sofa"):
 ${list}
 
-لكل بند:
-- لقيته في مكانه (الغرفة المذكورة جنبه) → status:"present".
-- مش لاقيه، والفيديو/الصور فعلاً وصلت وصوّرت نفس مكانه بوضوح → status:"missing"، وحدد severity: high لو غرض أساسي (أثاث، جهاز كهربائي، تلفزيون، إضاءة، مرايا)، low لو غرض استهلاكي صغير (مناديل، صابون، شامبو، شمعة).
-- المكان أصلاً ما اتصوّرش خالص → status:"unclear" (من غير severity).
+رجّع JSON بس، من غير أي كلام قبله أو بعده:
+{ "translations": [ { "id": رقم البند, "en": "الترجمة الإنجليزية" } ] }`;
 
-لازم ترجع بالظبط ${chunk.length} عنصر في inventory_status، واحد لكل رقم فوق بالترتيب، من غير ما تسيب ولا واحد.
+  try {
+    const out = await callGemini([{ text: prompt }]);
+    const map = {};
+    (out.translations || []).forEach(t => { if (t && t.id != null && t.en) map[t.id] = t.en; });
+    return map;
+  } catch (e) {
+    return {}; // فشلت الترجمة؟ هنستخدم الاسم العربي زي ما هو بدل ما نوقف كل حاجة
+  }
+}
 
-رجّع JSON بس، من غير أي كلام قبله أو بعده ومن غير علامات كود:
-{
-  "inventory_status": [
-    { "id": رقم البند من القائمة فوق, "status": "present" أو "missing" أو "unclear", "severity": "low" أو "medium" أو "high" (لو missing بس، وإلا سيبها فاضية), "confidence": رقم بين 0 و 1 }
-  ]
-}`;
+/** بتسأل Grounding DINO + SAM: الغرض ده موجود في الصورة المجمّعة ولا لأ؟
+ *  present  = لقى صورة/قناع فعلي للغرض.
+ *  missing  = الـ detector مالقاش أي حاجة تطابق الاسم خالص (رد فشل معروف بالظبط).
+ *  unclear  = أي حاجة تانية (rate limit، مشكلة شبكة...) — مش هنخمّن، هنسيبه للمراجعة اليدوية. */
+async function checkItemPresence(compositeB64, itemNameEn, tries) {
+  for (let attempt = 0; attempt < tries; attempt++) {
+    try {
+      const res = await fetch(REPLICATE_PROXY, {
+        method : 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body   : JSON.stringify({
+          model: 'schananas/grounded_sam',
+          input: {
+            image: 'data:image/jpeg;base64,' + compositeB64,
+            mask_prompt: itemNameEn,
+            negative_mask_prompt: ''
+          }
+        })
+      });
+      const data = await res.json();
+
+      if (data.status === 429 || /throttl/i.test(data.detail || '')) {
+        await new Promise(r => setTimeout(r, 1500 * (attempt + 1)));
+        continue;
+      }
+      if (data.status === 'succeeded') {
+        return Array.isArray(data.output) && data.output.length > 0 ? 'present' : 'unclear';
+      }
+      if (data.status === 'failed' && /0 elements/.test(data.error || '')) {
+        return 'missing';
+      }
+      return 'unclear';
+    } catch (e) {
+      await new Promise(r => setTimeout(r, 1000));
+    }
+  }
+  return 'unclear';
 }
 
 /* =====================================================================
@@ -1027,26 +1100,34 @@ async function run(filesOrFrames, alreadyFrames) {
     const invRes    = await invPromise;
     const inventory = (invRes && invRes.ok) ? (invRes.items || []) : [];
     const indexed   = indexInventory(inventory);
-    const chunks    = chunkArray(indexed, CONFIG.INV_CHUNK_SIZE);
 
-    setStatus(chunks.length ? `بيفحص التلف، وبيتحقق من ${indexed.length} بند في الجرد (${chunks.length} دفعة)…` : 'بيفحص التلف…', 40);
+    setStatus(indexed.length ? `بيفحص التلف، وبيتحقق من ${indexed.length} بند في الجرد بالـ detector…` : 'بيفحص التلف…', 30);
 
-    // مكالمة التلف مستقلة تمامًا، وبتشتغل جنب دفعات الجرد مش بعدها
+    // مكالمة التلف مستقلة تمامًا (Gemini، وصف حالة)، وبتشتغل جنب فحص الجرد (Grounding DINO + SAM، كشف حقيقي) مش بعده
     const damagePromise = analyze(frames, buildDamagePrompt(apt));
 
-    let chunkResults = [];
-    if (chunks.length) {
+    let mergedStatus = [];
+    if (indexed.length) {
+      const [composite, enMap] = await Promise.all([
+        buildCompositeImage(frames),
+        translateItemsToEnglish(indexed)
+      ]);
+
       let done = 0;
-      const tasks = chunks.map(chunk => async () => {
-        const r = await analyze(frames, buildInventoryChunkPrompt(chunk));
+      const tasks = indexed.map(it => async () => {
+        const status = await checkItemPresence(composite, enMap[it.id] || it.item, 3);
         done++;
-        setStatus(`بيتحقق من الجرد… دفعة ${done} من ${chunks.length}`, 100);
-        return Array.isArray(r.inventory_status) ? r.inventory_status : [];
+        setStatus(`بيتحقق من الجرد… ${done} من ${indexed.length}`, 30 + Math.round(done / indexed.length * 60));
+        return {
+          id: it.id,
+          status,
+          severity: status === 'missing' ? 'medium' : undefined,
+          confidence: status === 'present' ? 0.9 : (status === 'missing' ? 0.75 : 0.3)
+        };
       });
-      chunkResults = await runWithConcurrency(tasks, CONFIG.INV_CONCURRENCY);
+      mergedStatus = await runWithConcurrency(tasks, CONFIG.INV_CONCURRENCY);
     }
 
-    const mergedStatus = [].concat(...chunkResults);
     const audit = auditInventory(mergedStatus, indexed);
     auditTotal  = indexed.length;
     auditGap    = audit.gap;

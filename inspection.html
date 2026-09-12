@@ -775,10 +775,11 @@ async function analyze(frames, prompt) {
 /* =====================================================================
    وضع التجربة — قبل / بعد
    ===================================================================== */
-/* وضع التجربة بقى شغال بمكالمتين منفصلتين لـ Gemini بدل مكالمة واحدة:
-   1) "الجرد" — يعمل قائمة مرقّمة بكل حاجة شايفها في "قبل" (زي ما بنعمل مع قائمة الجرد الرسمية).
-   2) "التحقق" — ياخد نفس القائمة دي رقم رقم ويتأكد من كل بند فيها جوه "بعد"، وبرضو
-      بيدوّر لوحده على أي حاجة جديدة/متغيرة/تلف. وبعدين إحنا بنعد بأنفسنا كام بند اتفحص فعلاً. */
+/* وضع التجربة بقى شغال بخطوتين مختلفتين تمامًا:
+   1) "الجرد" — Gemini يعمل قائمة مرقّمة بكل حاجة شايفها في "قبل" (محتاجين موديل لغوي هنا
+      لأن معندناش قائمة جاهزة زي الشقة الحقيقية — لازم حد "يكتشف" الأول).
+   2) "التحقق" — نفس الـ detector الحقيقي (Grounding DINO + SAM) اللي بيشتغل مع الشقق الحقيقية،
+      بيتأكد من كل بند في القائمة دي واحد واحد جوه "بعد". مفيش تخمين موديل لغوي في خطوة التحقق خالص. */
 function buildCatalogPrompt() {
   return `دي أول خطوة بس في تجربة كشف فروق قبل/بعد — لسه من غير أي مقارنة.
 
@@ -790,52 +791,6 @@ function buildCatalogPrompt() {
     { "id": رقم تسلسلي يبدأ من 1, "item": "اسم الحاجة بالعربي", "room": "مكانها" }
   ]
 }`;
-}
-
-function buildVerifyPrompt(beforeItems) {
-  const list = beforeItems.map(it => `#${it.id} ${it.item} (${it.room})`).join('\n');
-  return `دي تكملة تجربة كشف فروق قبل/بعد. الوسائط اللي جاية دلوقتي هي مجموعة "بعد".
-
-القائمة دي هي كل حاجة اتشافت في مجموعة "قبل" (من خطوة سابقة)، كل بند برقمه:
-${list}
-
-مطلوب منك حاجتين بالترتيب:
-
-1) تتحقق من كل بند في القائمة دي بالرقم، واحد واحد، بالظبط ${beforeItems.length} بند — وترجعهم كلهم في "item_status" من غير ما تسيب ولا واحد:
-   • لقيته في "بعد" في نفس المكان أو قريب منه → status:"present".
-   • مش لاقيه، والوسائط فعلاً وصلت وصوّرت نفس مكانه بوضوح → status:"missing".
-   • المكان أصلاً ما اتصوّرش خالص في "بعد" → status:"unclear".
-   هنعد إحنا بأنفسنا كام بند اتفحص، فلو نقصت بند من الرد هيبان.
-
-2) بعد كده بس، لوحدك، دوّر في "بعد" على: أي حاجة جديدة ظهرت مكانتش في القائمة، أي حاجة اتغيّر مكانها أو وضعها، وأي كسر أو خدش أو تلف أو بقعة.
-
-قواعد:
-- متخترعش حاجة مشفتهاش فعلاً. كل نتيجة لازم يكون ليها دليل واضح في الوسائط.
-- لو مش متأكد، سجّله بـ confidence واطية بدل ما تتجاهله.
-- ممنوع تحط أي بند من القائمة دي جوه findings — المفقود بيتسجل بس جوه item_status.
-- في description_ar وضّح إن ده جديد ولا اتغيّر مكانه ولا تلف، وسيب timestamp فاضي دايمًا.
-
-رجّع JSON بس، من غير أي كلام قبله أو بعده ومن غير علامات كود:
-{
-  "overall": "clean" أو "issues",
-  "summary_ar": "سطر واحد بالعامية المصرية يلخص الفرق الرئيسي",
-  "item_status": [
-    { "id": رقم من القائمة فوق, "status": "present" أو "missing" أو "unclear", "confidence": رقم بين 0 و 1 }
-  ],
-  "findings": [
-    {
-      "item": "اسم الحاجة بالعربي",
-      "location": "مكانها",
-      "type": "tear" أو "burn" أو "crack" أو "stain" أو "melt" أو "water" أو "added" أو "moved" أو "other",
-      "description_ar": "وصف قصير بالعامية",
-      "timestamp": "",
-      "severity": "low" أو "medium" أو "high",
-      "confidence": رقم بين 0 و 1,
-      "claimable": false
-    }
-  ]
-}
-لو مفيش فرق واضح، رجّع overall = "clean" و findings = [].`;
 }
 
 async function runTestMode(beforeFiles, afterFiles) {
@@ -852,29 +807,44 @@ async function runTestMode(beforeFiles, afterFiles) {
   player.classList.add('on');
 
   try {
-    setStatus('بيجهّز صور "قبل" من الفيديو…', 20);
+    setStatus('بيجهّز صور "قبل" من الفيديو…', 10);
     const beforeFrames = await prepareMedia(beforeFiles);
-    setStatus('بيجهّز صور "بعد" من الفيديو…', 40);
+    setStatus('بيجهّز صور "بعد" من الفيديو…', 20);
     const afterFrames = await prepareMedia(afterFiles);
 
-    setStatus('بيعمل قائمة بكل حاجة في "قبل"…', 60);
+    setStatus('بيعمل قائمة بكل حاجة في "قبل" (Gemini)…', 30);
     const catalog = await callGemini([...framesToParts(beforeFrames), { text: buildCatalogPrompt() }]);
     const beforeItems = Array.isArray(catalog.items) ? catalog.items.filter(it => it && it.id != null && it.item) : [];
 
-    setStatus(`بيتحقق من ${beforeItems.length} بند في "بعد"…`, 80);
-    const verify = await callGemini([
-      { text: 'الصور الجاية دي مجموعة "بعد" — الحالة الحالية اللي هنقارنها بالأول:' },
-      ...framesToParts(afterFrames),
-      { text: buildVerifyPrompt(beforeItems) }
+    if (!beforeItems.length) throw new Error('مقدرش أعمل قائمة حاجات من "قبل"');
+
+    setStatus(`بيتحقق من ${beforeItems.length} بند بالـ detector في "بعد"…`, 40);
+    const [afterComposite, enMap] = await Promise.all([
+      buildCompositeImage(afterFrames),
+      translateItemsToEnglish(beforeItems.map(it => ({ id: it.id, item: it.item })))
     ]);
 
-    const audit = auditInventory(verify.item_status, beforeItems.map(it => ({ id: it.id, item: it.item, room: it.room })));
+    let done = 0;
+    const tasks = beforeItems.map(it => async () => {
+      const status = await checkItemPresence(afterComposite, enMap[it.id] || it.item, 3);
+      done++;
+      setStatus(`بيتحقق… ${done} من ${beforeItems.length}`, 40 + Math.round(done / beforeItems.length * 55));
+      return {
+        id: it.id,
+        status,
+        severity: status === 'missing' ? 'medium' : undefined,
+        confidence: status === 'present' ? 0.9 : (status === 'missing' ? 0.75 : 0.3)
+      };
+    });
+    const statusArr = await runWithConcurrency(tasks, CONFIG.INV_CONCURRENCY);
+
+    const audit = auditInventory(statusArr, beforeItems.map(it => ({ id: it.id, item: it.item, room: it.room })));
     auditTotal  = beforeItems.length;
     auditGap    = audit.gap;
 
-    overall  = verify.overall || (audit.missingFindings.length ? 'issues' : 'clean');
-    summary  = verify.summary_ar || '';
-    findings = [...audit.missingFindings, ...(verify.findings || [])].map((f, i) => ({ ...f, n: i + 1, keep: true }));
+    overall  = audit.missingFindings.length ? 'issues' : 'clean';
+    summary  = audit.missingFindings.length ? '' : 'مفيش حاجة اتشالت من "قبل".';
+    findings = audit.missingFindings.map((f, i) => ({ ...f, n: i + 1, keep: true }));
 
     $('status').classList.remove('on');
     render(true);

@@ -106,6 +106,12 @@ select:focus,input:focus{outline:2px solid var(--green);outline-offset:1px}
 video{width:100%;border-radius:var(--r);background:#000;display:none;margin-bottom:18px}
 video.on{display:block}
 
+/* ---------- الكاميرا التلقائية ---------- */
+#camBox{margin:14px 0}
+#camVideo{display:block;width:100%;border-radius:var(--r);background:#000;margin-bottom:10px;transition:filter .1s}
+.camStatus{font-size:15px;font-weight:600;text-align:center;margin-bottom:4px}
+.camCount{font-size:13px;color:var(--muted);text-align:center}
+
 /* ---------- النتيجة ---------- */
 #result{display:none}
 #result.on{display:block}
@@ -240,8 +246,19 @@ video.on{display:block}
   </ul>
 </div>
 
-<button class="capture" id="pick">صوّر أو اختار فيديو/صور<em>تقدر تختار أكتر من ملف مرة واحدة</em></button>
+<button class="capture" id="autoCam" style="border-color:var(--green)">📷 كاميرا تلقائية — بتصوّر لوحدها<em>تحرك جوه الأوضة، والنظام هياخد صور واضحة لوحده</em></button>
+<button class="capture" id="pick" style="margin-top:8px">صوّر أو اختار فيديو/صور يدوي<em>تقدر تختار أكتر من ملف مرة واحدة</em></button>
 <input type="file" id="file" accept="video/*,image/*" multiple>
+
+<div id="camBox" hidden>
+  <video id="camVideo" playsinline muted autoplay></video>
+  <div class="camStatus" id="camStatus">بيفتح الكاميرا…</div>
+  <div class="camCount" id="camCount">لسه مفيش صور</div>
+  <div style="display:flex;gap:8px;margin-top:10px">
+    <button type="button" class="capture" id="camDone" style="margin:0;flex:1;padding:14px">خلصت — كمّل الفحص</button>
+    <button type="button" class="linklike" id="camCancel">إلغاء</button>
+  </div>
+</div>
 
 </div>
 
@@ -810,6 +827,133 @@ $('file').onchange = async e => {
 };
 
 /* =====================================================================
+   الكاميرا التلقائية — تفتح الكاميرا الحية وتصوّر لوحدها من غير مصوّر
+   بتاخد صورة بس لما الكادر يكون واضح (مش متزوّم) وثابت (الإيد وقفت)،
+   وبترفض تصوّر نفس المكان اللي اتصور قبل كده عشان متكررش.
+   ===================================================================== */
+const CAM = {
+  SMALL          : 64,   // حجم الصورة المصغّرة اللي بنحلل عليها الثبات والوضوح
+  STEADY_DIFF    : 4,    // متوسط فرق البكسلات اللي تحته نعتبر الكادر "ثابت"
+  STEADY_FRAMES  : 4,    // كام تشيك متتالي ثابت قبل ما نعتبره جاهز للتصوير
+  DUP_DIFF       : 10,   // لو الفرق عن صورة سابقة أقل من كده، يبقى نفس المكان — متتصورش تاني
+  SHARP_MIN      : 12    // أقل قيمة وضوح (حواف) نقبلها — تحتها الكادر متزوّم
+};
+
+let camStream = null, camRunning = false, camCaptures = [], camPrevGray = null, camSteadyCount = 0, camPrevCaptureGrays = [];
+
+function camGrabSmallGray(video, size) {
+  const w = size, h = Math.max(1, Math.round(size * video.videoHeight / video.videoWidth));
+  const c = document.createElement('canvas');
+  c.width = w; c.height = h;
+  c.getContext('2d').drawImage(video, 0, 0, w, h);
+  const data = c.getContext('2d').getImageData(0, 0, w, h).data;
+  const gray = new Uint8ClampedArray(w * h);
+  for (let i = 0; i < gray.length; i++) {
+    const o = i * 4;
+    gray[i] = data[o] * 0.3 + data[o + 1] * 0.59 + data[o + 2] * 0.11;
+  }
+  return { gray, w, h };
+}
+
+function camFrameDiff(a, b) {
+  let sum = 0;
+  for (let i = 0; i < a.length; i++) sum += Math.abs(a[i] - b[i]);
+  return sum / a.length;
+}
+
+function camSharpness(gray, w, h) {
+  let energy = 0, n = 0;
+  for (let y = 1; y < h - 1; y++) {
+    for (let x = 1; x < w - 1; x++) {
+      const i = y * w + x;
+      const lap = 4 * gray[i] - gray[i - 1] - gray[i + 1] - gray[i - w] - gray[i + w];
+      energy += lap * lap;
+      n++;
+    }
+  }
+  return n ? energy / n : 0;
+}
+
+async function startAutoCam() {
+  if (!$('apt').value) { alert('اختار الشقة الأول'); return; }
+
+  camCaptures = []; camPrevGray = null; camSteadyCount = 0; camPrevCaptureGrays = [];
+  $('camBox').hidden = false;
+  $('camStatus').textContent = 'بيفتح الكاميرا…';
+  $('camCount').textContent = 'لسه مفيش صور';
+
+  try {
+    camStream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: 'environment', width: { ideal: 1280 }, height: { ideal: 720 } }
+    });
+  } catch (e) {
+    alert('مقدرش أفتح الكاميرا: ' + e.message);
+    $('camBox').hidden = true;
+    return;
+  }
+
+  $('camVideo').srcObject = camStream;
+  camRunning = true;
+  $('camStatus').textContent = 'استحمل الموبايل ثابت شوية على كل حتة';
+  requestAnimationFrame(camLoop);
+}
+
+function stopAutoCam() {
+  camRunning = false;
+  if (camStream) { camStream.getTracks().forEach(t => t.stop()); camStream = null; }
+  $('camBox').hidden = true;
+}
+
+function camLoop() {
+  if (!camRunning) return;
+  const video = $('camVideo');
+
+  if (video.readyState >= 2 && video.videoWidth) {
+    const { gray, w, h } = camGrabSmallGray(video, CAM.SMALL);
+
+    if (camPrevGray) {
+      const diff = camFrameDiff(gray, camPrevGray);
+      camSteadyCount = diff < CAM.STEADY_DIFF ? camSteadyCount + 1 : 0;
+
+      if (camSteadyCount === CAM.STEADY_FRAMES) {
+        const sharp = camSharpness(gray, w, h);
+        if (sharp >= CAM.SHARP_MIN) {
+          const isDup = camPrevCaptureGrays.some(g => camFrameDiff(gray, g) < CAM.DUP_DIFF);
+          if (!isDup) {
+            const canvas = drawScaled(video, video.videoWidth, video.videoHeight);
+            camCaptures.push(canvasToBase64(canvas));
+            camPrevCaptureGrays.push(gray);
+            $('camCount').textContent = `اتصور ${camCaptures.length} صورة لحد دلوقتي`;
+            $('camStatus').textContent = 'تمام! كمّل لمكان تاني';
+            $('camVideo').style.filter = 'brightness(1.6)';
+            setTimeout(() => { $('camVideo').style.filter = ''; }, 150);
+          } else {
+            $('camStatus').textContent = 'المكان ده اتصور قبل كده — كمّل لمكان تاني';
+          }
+        } else {
+          $('camStatus').textContent = 'قرّب أو ثبّت الكاميرا أكتر — مش واضح';
+        }
+        camSteadyCount = 0;
+      } else if (diff >= CAM.STEADY_DIFF) {
+        $('camStatus').textContent = 'استحمل الموبايل ثابت شوية على كل حتة';
+      }
+    }
+    camPrevGray = gray;
+  }
+
+  requestAnimationFrame(camLoop);
+}
+
+$('autoCam').onclick = () => startAutoCam();
+$('camCancel').onclick = () => stopAutoCam();
+$('camDone').onclick = () => {
+  const captured = camCaptures.slice();
+  stopAutoCam();
+  if (!captured.length) { alert('لسه معملتش أي صورة'); return; }
+  run(captured, true);
+};
+
+/* =====================================================================
    تبديل الوضع: شقة حقيقية / تجربة قبل-بعد
    ===================================================================== */
 let testBefore = [], testAfter = [];
@@ -850,7 +994,7 @@ function setStatus(msg, pct, isErr) {
   $('statBar').style.width = (pct == null ? 0 : pct) + '%';
 }
 
-async function run(files) {
+async function run(filesOrFrames, alreadyFrames) {
   const apt = apts.find(a => a.apt_id === $('apt').value);
 
   auditTotal = 0; auditGap = 0;
@@ -858,20 +1002,27 @@ async function run(files) {
   $('saveRow').classList.remove('on');
   $('pick').disabled = true;
 
-  const previewFile = files.find(f => (f.type || '').startsWith('video/')) || files[0];
-  const player = $('player');
-  player.src = URL.createObjectURL(previewFile);
-  player.classList.add('on');
+  if (!alreadyFrames) {
+    const previewFile = filesOrFrames.find(f => (f.type || '').startsWith('video/')) || filesOrFrames[0];
+    const player = $('player');
+    player.src = URL.createObjectURL(previewFile);
+    player.classList.add('on');
+  }
 
   try {
     const invPromise = apt
       ? jsonp({ action: 'inventory', apt_id: apt.apt_id }).catch(() => ({ ok: false }))
       : Promise.resolve({ ok: false });
 
-    setStatus('بيجهّز الصور من الفيديو…', 10);
-    const frames = await prepareMedia(files, (i, total) =>
-      setStatus(`بيجهّز الصور من الفيديو… ملف ${i + 1} من ${total}`, 10)
-    );
+    let frames;
+    if (alreadyFrames) {
+      frames = filesOrFrames; // صور اتصورت بالفعل من الكاميرا التلقائية — من غير أي استخراج
+    } else {
+      setStatus('بيجهّز الصور من الفيديو…', 10);
+      frames = await prepareMedia(filesOrFrames, (i, total) =>
+        setStatus(`بيجهّز الصور من الفيديو… ملف ${i + 1} من ${total}`, 10)
+      );
+    }
 
     const invRes    = await invPromise;
     const inventory = (invRes && invRes.ok) ? (invRes.items || []) : [];

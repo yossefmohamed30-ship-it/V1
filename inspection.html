@@ -298,14 +298,17 @@ video.on{display:block}
 const CONFIG = {
   SCRIPT_URL     : 'https://script.google.com/macros/s/AKfycbz_v-JJlXjzgliDZKdahRkZ7xADNvuUbjqgiHT1pcrt9ZPeOLlsbL3_UcfaHCPLv8k/exec',
   MODEL          : 'gemini-3.6-flash',
-  FPS            : 2,          // فريمين في الثانية — أدق للتفاصيل الصغيرة
-  MEDIA_RES      : '',         // مش مدعومة حاليًا في الـ API — سيبها فاضية
   BY             : '',         // اسم اللي بيستلم (اختياري)
+  MAX_FRAMES     : 16,         // أقصى عدد فريمات ناخدها من كل فيديو (موزّعين بالتساوي على طول الفيديو) — لو الوسائط صور بس، مش بتتفعّل خالص
+  FRAME_MAX_DIM  : 1024,       // أقصى بعد للصورة (عرض أو ارتفاع) بعد الضغط — عشان الحجم يفضل معقول
+  JPEG_QUALITY   : 0.75,
   INV_CHUNK_SIZE : 25,         // كام بند نبعت للموديل في كل مكالمة — قليل عمدًا عشان يفحص كل بند فعلاً بدل ما يلخّص
   INV_CONCURRENCY: 3           // كام مكالمة تشتغل في نفس الوقت وهو بيدور على دفعات الجرد
 };
 
-const API = 'https://generativelanguage.googleapis.com';
+/* بنستخدم endpoint الرسمي والمستقر generateContent بدل الـ Interactions API القديمة —
+   ده بيدّينا نبعت صور base64 مباشرة من غير أي رفع ملفات خالص */
+const GEMINI_API = 'https://generativelanguage.googleapis.com/v1beta/models';
 
 /* مفتاح Gemini بيتجاب وقت التشغيل من Apps Script — متخزنش في الكود خالص */
 let GEMINI_KEY = '';
@@ -560,94 +563,114 @@ ${list}
 }
 
 /* =====================================================================
-   رفع الفيديو على Gemini (resumable) مع نسبة تقدم
+   تجهيز الصور محليًا في المتصفح — من غير رفع أي ملف لأي سيرفر
+   الفيديو بيتحوّل لمجموعة فريمات (صور) بالـ canvas، والصور بتتضغط وتتبعت زي ما هي.
+   ده بيلغي وقت الرفع الطويل خالص، وبيدّي الموديل صور واضحة بدل فريمات فيديو مضغوطة.
    ===================================================================== */
-function startUpload(file) {
-  return fetch(API + '/upload/v1beta/files', {
-    method : 'POST',
-    headers: {
-      'x-goog-api-key'                  : GEMINI_KEY,
-      'X-Goog-Upload-Protocol'          : 'resumable',
-      'X-Goog-Upload-Command'           : 'start',
-      'X-Goog-Upload-Header-Content-Length': String(file.size),
-      'X-Goog-Upload-Header-Content-Type'  : file.type || 'video/mp4',
-      'Content-Type'                    : 'application/json'
-    },
-    body: JSON.stringify({ file: { display_name: file.name || 'walkthrough' } })
-  }).then(res => {
-    const url = res.headers.get('x-goog-upload-url');
-    if (!url) throw new Error('الرفع مبدأش — راجع مفتاح Gemini');
-    return url;
-  });
-}
-
-function sendBytes(uploadUrl, file, onProgress) {
+function loadVideoEl(file) {
   return new Promise((resolve, reject) => {
-    const xhr = new XMLHttpRequest();
-    xhr.open('POST', uploadUrl, true);
-    xhr.setRequestHeader('X-Goog-Upload-Offset', '0');
-    xhr.setRequestHeader('X-Goog-Upload-Command', 'upload, finalize');
-
-    xhr.upload.onprogress = e => {
-      if (e.lengthComputable) onProgress(Math.round(e.loaded / e.total * 100));
-    };
-    xhr.onerror = () => reject(new Error('الرفع اتقطع — راجع النت'));
-    xhr.onload  = () => {
-      if (xhr.status < 200 || xhr.status >= 300) return reject(new Error('الرفع فشل (' + xhr.status + ')'));
-      try { resolve(JSON.parse(xhr.responseText).file); }
-      catch (e) { reject(new Error('رد الرفع مش مفهوم')); }
-    };
-    xhr.send(file);
+    const v = document.createElement('video');
+    v.preload = 'auto';
+    v.muted = true;
+    v.playsInline = true;
+    v.src = URL.createObjectURL(file);
+    v.onloadedmetadata = () => resolve(v);
+    v.onerror = () => reject(new Error('مقدرش يقرا الفيديو ده'));
   });
 }
 
-async function waitActive(name) {
-  for (let i = 0; i < 60; i++) {
-    const r = await fetch(API + '/v1beta/' + name, {
-      headers: { 'x-goog-api-key': GEMINI_KEY }
-    });
-    const f = await r.json();
-    if (f.state === 'ACTIVE') return f;
-    if (f.state === 'FAILED') throw new Error('Gemini مقدرش يقرا الفيديو');
-    await new Promise(r => setTimeout(r, 4000));
+function seekTo(video, t) {
+  return new Promise(resolve => {
+    const onSeeked = () => { video.removeEventListener('seeked', onSeeked); resolve(); };
+    video.addEventListener('seeked', onSeeked);
+    video.currentTime = t;
+  });
+}
+
+function canvasToBase64(canvas) {
+  const dataUrl = canvas.toDataURL('image/jpeg', CONFIG.JPEG_QUALITY);
+  return dataUrl.slice(dataUrl.indexOf(',') + 1);
+}
+
+function drawScaled(img, w, h) {
+  const scale = Math.min(1, CONFIG.FRAME_MAX_DIM / Math.max(w, h));
+  const cw = Math.max(1, Math.round(w * scale));
+  const ch = Math.max(1, Math.round(h * scale));
+  const canvas = document.createElement('canvas');
+  canvas.width = cw; canvas.height = ch;
+  canvas.getContext('2d').drawImage(img, 0, 0, cw, ch);
+  return canvas;
+}
+
+/** بتاخد فيديو وترجّع مجموعة فريمات (base64 JPEG) موزّعة بالتساوي على طول الفيديو */
+async function extractFrames(file, maxFrames) {
+  const video = await loadVideoEl(file);
+  const duration = video.duration || 0;
+  const n = duration > 0 ? Math.min(maxFrames, Math.max(4, Math.round(duration))) : 1;
+  const frames = [];
+
+  for (let i = 0; i < n; i++) {
+    const t = n === 1 ? 0 : (duration * (i + 0.5)) / n;
+    await seekTo(video, t);
+    const canvas = drawScaled(video, video.videoWidth, video.videoHeight);
+    frames.push(canvasToBase64(canvas));
   }
-  throw new Error('الفيديو أخد وقت أطول من اللازم');
+
+  URL.revokeObjectURL(video.src);
+  return frames;
+}
+
+/** بتاخد صورة وترجّعها base64 JPEG مضغوطة */
+function imageToBase64(file) {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => {
+      const canvas = drawScaled(img, img.naturalWidth, img.naturalHeight);
+      resolve(canvasToBase64(canvas));
+      URL.revokeObjectURL(img.src);
+    };
+    img.onerror = () => reject(new Error('مقدرش يقرا الصورة دي'));
+    img.src = URL.createObjectURL(file);
+  });
+}
+
+/** بتحوّل كل الملفات (فيديوهات وصور) لمجموعة صور base64 واحدة — دي اللي هتتبعت مع كل مكالمة للموديل */
+async function prepareMedia(files, onProgress) {
+  const frames = [];
+  for (let i = 0; i < files.length; i++) {
+    const f = files[i];
+    onProgress && onProgress(i, files.length);
+    if ((f.type || '').startsWith('video/')) {
+      frames.push(...await extractFrames(f, CONFIG.MAX_FRAMES));
+    } else {
+      frames.push(await imageToBase64(f));
+    }
+  }
+  return frames;
 }
 
 /* =====================================================================
-   التحليل
+   التحليل — Gemini (generateContent، صور base64 مباشرة من غير رفع ملفات)
    ===================================================================== */
-function mediaToParts(mediaList) {
-  return mediaList.map(m => {
-    if (m.isVideo) {
-      return {
-        type      : 'video',
-        uri       : m.uri,
-        mime_type : m.mime || 'video/mp4',
-        processing: { type: 'static', fps: CONFIG.FPS }
-      };
-    }
-    return { type: 'image', uri: m.uri, mime_type: m.mime || 'image/jpeg' };
-  });
+function framesToParts(frames) {
+  return frames.map(b64 => ({ inline_data: { mime_type: 'image/jpeg', data: b64 } }));
 }
 
-async function callGemini(inputParts) {
-  const res = await fetch(API + '/v1beta/interactions', {
+async function callGemini(parts) {
+  const url = `${GEMINI_API}/${CONFIG.MODEL}:generateContent`;
+  const res = await fetch(url, {
     method : 'POST',
     headers: { 'x-goog-api-key': GEMINI_KEY, 'Content-Type': 'application/json' },
-    body   : JSON.stringify({ model: CONFIG.MODEL, input: inputParts })
+    body   : JSON.stringify({ contents: [{ parts }] })
   });
 
   const data = await res.json();
   if (data.error) throw new Error(data.error.message || 'Gemini رجّع إيرور');
 
-  let text = data.output_text || '';
-  if (!text && Array.isArray(data.steps)) {
-    data.steps.forEach(st => {
-      if (Array.isArray(st.content)) {
-        st.content.forEach(c => { if (c && c.text) text += c.text; });
-      }
-    });
+  let text = '';
+  const cand = data.candidates && data.candidates[0];
+  if (cand && cand.content && Array.isArray(cand.content.parts)) {
+    cand.content.parts.forEach(p => { if (p && p.text) text += p.text; });
   }
 
   const s = text.indexOf('{'), e = text.lastIndexOf('}');
@@ -655,8 +678,8 @@ async function callGemini(inputParts) {
   return JSON.parse(text.slice(s, e + 1));
 }
 
-async function analyze(mediaList, prompt) {
-  return callGemini([...mediaToParts(mediaList), { type: 'text', text: prompt }]);
+async function analyze(frames, prompt) {
+  return callGemini([...framesToParts(frames), { text: prompt }]);
 }
 
 /* =====================================================================
@@ -739,29 +762,20 @@ async function runTestMode(beforeFiles, afterFiles) {
   player.classList.add('on');
 
   try {
-    const beforeMedia = [];
-    const afterMedia  = [];
-    const all = [...beforeFiles.map(f => ({ f, grp: 'قبل' })), ...afterFiles.map(f => ({ f, grp: 'بعد' }))];
+    setStatus('بيجهّز صور "قبل" من الفيديو…', 20);
+    const beforeFrames = await prepareMedia(beforeFiles);
+    setStatus('بيجهّز صور "بعد" من الفيديو…', 40);
+    const afterFrames = await prepareMedia(afterFiles);
 
-    for (let i = 0; i < all.length; i++) {
-      const { f, grp } = all[i];
-      const base = Math.round(i / all.length * 100);
-      setStatus(`بيرفع (${grp}) ملف ${i + 1} من ${all.length}…`, base);
-      const u = await uploadOneFile(f, p =>
-        setStatus(`بيرفع (${grp}) ملف ${i + 1} من ${all.length}… ${p}%`, Math.round(base + p / all.length))
-      );
-      (grp === 'قبل' ? beforeMedia : afterMedia).push(u);
-    }
-
-    setStatus('بيعمل قائمة بكل حاجة في "قبل"…', 90);
-    const catalog = await callGemini([...mediaToParts(beforeMedia), { type: 'text', text: buildCatalogPrompt() }]);
+    setStatus('بيعمل قائمة بكل حاجة في "قبل"…', 60);
+    const catalog = await callGemini([...framesToParts(beforeFrames), { text: buildCatalogPrompt() }]);
     const beforeItems = Array.isArray(catalog.items) ? catalog.items.filter(it => it && it.id != null && it.item) : [];
 
-    setStatus(`بيتحقق من ${beforeItems.length} بند في "بعد"…`, 95);
+    setStatus(`بيتحقق من ${beforeItems.length} بند في "بعد"…`, 80);
     const verify = await callGemini([
-      { type: 'text', text: 'الوسائط الجاية دي مجموعة "بعد" — الحالة الحالية اللي هنقارنها بالأول:' },
-      ...mediaToParts(afterMedia),
-      { type: 'text', text: buildVerifyPrompt(beforeItems) }
+      { text: 'الصور الجاية دي مجموعة "بعد" — الحالة الحالية اللي هنقارنها بالأول:' },
+      ...framesToParts(afterFrames),
+      { text: buildVerifyPrompt(beforeItems) }
     ]);
 
     const audit = auditInventory(verify.item_status, beforeItems.map(it => ({ id: it.id, item: it.item, room: it.room })));
@@ -836,18 +850,6 @@ function setStatus(msg, pct, isErr) {
   $('statBar').style.width = (pct == null ? 0 : pct) + '%';
 }
 
-async function uploadOneFile(file, onProgress) {
-  const uploadUrl = await startUpload(file);
-  const meta      = await sendBytes(uploadUrl, file, onProgress);
-  const ready     = await waitActive(meta.name);
-  return {
-    uri    : ready.uri,
-    mime   : ready.mimeType || file.type,
-    isVideo: (file.type || '').startsWith('video/'),
-    name   : file.name || ''
-  };
-}
-
 async function run(files) {
   const apt = apts.find(a => a.apt_id === $('apt').value);
 
@@ -866,32 +868,26 @@ async function run(files) {
       ? jsonp({ action: 'inventory', apt_id: apt.apt_id }).catch(() => ({ ok: false }))
       : Promise.resolve({ ok: false });
 
-    const uploaded = [];
-    for (let i = 0; i < files.length; i++) {
-      const f = files[i];
-      const base = Math.round(i / files.length * 100);
-      setStatus(`بيرفع ملف ${i + 1} من ${files.length}…`, base);
-      const u = await uploadOneFile(f, p =>
-        setStatus(`بيرفع ملف ${i + 1} من ${files.length}… ${p}%`, Math.round(base + p / files.length))
-      );
-      uploaded.push(u);
-    }
+    setStatus('بيجهّز الصور من الفيديو…', 10);
+    const frames = await prepareMedia(files, (i, total) =>
+      setStatus(`بيجهّز الصور من الفيديو… ملف ${i + 1} من ${total}`, 10)
+    );
 
     const invRes    = await invPromise;
     const inventory = (invRes && invRes.ok) ? (invRes.items || []) : [];
     const indexed   = indexInventory(inventory);
     const chunks    = chunkArray(indexed, CONFIG.INV_CHUNK_SIZE);
 
-    setStatus(chunks.length ? `بيفحص التلف، وبيتحقق من ${indexed.length} بند في الجرد (${chunks.length} دفعة)…` : 'بيفحص التلف…', 100);
+    setStatus(chunks.length ? `بيفحص التلف، وبيتحقق من ${indexed.length} بند في الجرد (${chunks.length} دفعة)…` : 'بيفحص التلف…', 40);
 
     // مكالمة التلف مستقلة تمامًا، وبتشتغل جنب دفعات الجرد مش بعدها
-    const damagePromise = analyze(uploaded, buildDamagePrompt(apt));
+    const damagePromise = analyze(frames, buildDamagePrompt(apt));
 
     let chunkResults = [];
     if (chunks.length) {
       let done = 0;
       const tasks = chunks.map(chunk => async () => {
-        const r = await analyze(uploaded, buildInventoryChunkPrompt(chunk));
+        const r = await analyze(frames, buildInventoryChunkPrompt(chunk));
         done++;
         setStatus(`بيتحقق من الجرد… دفعة ${done} من ${chunks.length}`, 100);
         return Array.isArray(r.inventory_status) ? r.inventory_status : [];
